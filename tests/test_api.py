@@ -608,6 +608,108 @@ class StreamTests(ApiCase):
         self.assertTrue(gate.closed.is_set(), 'upstream was not abandoned after the client left')
         self.assertTrue(self.upstream.transports[0].closed)
 
+    def assert_json_error(self, reply, status, code, error_type='upstream_error'):
+        self.assertEqual(reply.status, status)
+        self.assertEqual(reply.headers.getheader('Content-Type'), 'application/json')
+        body = reply.json()
+        self.assertEqual(set(body['error']), {'message', 'type', 'param', 'code'})
+        self.assertEqual((body['error']['type'], body['error']['code']), (error_type, code))
+        self.assertNotIn(TOKEN, reply.body.decode())
+        self.assertNotIn(b'data: ', reply.body)
+
+    def test_upstream_timeout_before_first_chunk_is_504_json_for_stream_and_non_stream(self):
+        self.upstream.respond = lambda payload: TimeoutError(f'secret-detail {TOKEN}')
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                reply = self.chat({'stream': stream})
+                self.assert_json_error(reply, 504, 'upstream_timeout')
+                self.assertNotIn('secret-detail', reply.body.decode())
+
+    def test_socket_timeout_is_also_504(self):
+        self.upstream.respond = lambda payload: socket.timeout('read timed out')
+        self.assert_json_error(self.chat({'stream': True}), 504, 'upstream_timeout')
+
+    def test_upstream_connection_error_before_first_chunk_is_502_json(self):
+        for error in (ConnectionResetError(f'reset {TOKEN}'), ConnectionRefusedError('refused'),
+                      BrokenPipeError('pipe'), OSError('dns')):
+            self.upstream.respond = lambda payload, error=error: error
+            for stream in (False, True):
+                with self.subTest(error=type(error).__name__, stream=stream):
+                    self.assert_json_error(self.chat({'stream': stream}), 502, 'upstream_unavailable')
+
+    def test_upstream_failure_while_priming_the_stream_iterator_is_http_error(self):
+        class FailingRead(Raw):
+            def read1(self, size=-1):
+                raise TimeoutError('stalled')
+        self.upstream.respond = lambda payload: FailingRead(b'', headers={'Content-Type': 'text/event-stream'})
+        self.assert_json_error(self.chat({'stream': True}), 504, 'upstream_timeout')
+
+    def test_upstream_failure_after_first_chunk_is_sse_error_then_done(self):
+        for error, code in ((TimeoutError(f'stalled {TOKEN}'), 'upstream_timeout'),
+                            (ConnectionResetError(f'reset {TOKEN}'), 'upstream_unavailable')):
+            class FailingAfterFirst(Raw):
+                def read1(self, size=-1, error=error):
+                    data = super().read1(size)
+                    if data:
+                        return data
+                    raise error
+            self.upstream.respond = lambda payload, cls=FailingAfterFirst: cls(
+                sse(chunk('part ')), headers={'Content-Type': 'text/event-stream'})
+            with self.subTest(code=code):
+                reply = self.chat({'stream': True})
+                self.assertEqual(reply.status, 200)
+                events = reply.events()
+                self.assertEqual(events[1]['choices'][0]['delta'], {'content': 'part '})
+                self.assertEqual(events[-2]['error']['code'], code)
+                self.assertEqual(events[-1], '[DONE]')
+                self.assertNotIn(TOKEN, reply.body.decode())
+
+    def test_client_disconnect_mid_stream_logs_no_traceback_or_error(self):
+        gate = GatedRaw()
+        self.upstream.respond = lambda payload: gate
+        gate.push(chunk('first '))
+        err = StringIO()
+        with redirect_stderr(err):
+            conn = HTTPConnection('127.0.0.1', self.port, timeout=15)
+            self.addCleanup(conn.close)
+            conn.request('POST', '/v1/chat/completions', json.dumps(
+                {'stream': True, 'messages': [{'role': 'user', 'content': 'go'}]}),
+                {'Authorization': f'Bearer {TOKEN}'})
+            response = conn.getresponse()
+            seen = b''
+            while b'first ' not in seen:
+                seen += response.fp.readline()
+            response.close()
+            conn.close()
+            for _ in range(400):
+                if gate.closed.wait(0.02):
+                    break
+                gate.push(chunk('x' * 4096))
+            self.assertTrue(gate.closed.is_set())
+            self.assertTrue(self.upstream.transports[0].closed)
+        self.assertNotIn('Traceback', err.getvalue())
+        self.assertNotIn('internal error', err.getvalue())
+        self.assertNotIn(TOKEN, err.getvalue())
+
+    def test_client_gone_before_a_non_stream_reply_is_silent(self):
+        gate = GatedRaw()
+        self.upstream.respond = lambda payload: gate
+        err = StringIO()
+        with redirect_stderr(err):
+            with socket.create_connection(('127.0.0.1', self.port), timeout=15) as sock:
+                body = json.dumps({'messages': [{'role': 'user', 'content': 'go'}]})
+                sock.sendall((f'POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n'
+                              f'Authorization: Bearer {TOKEN}\r\nContent-Length: {len(body)}\r\n\r\n'
+                              f'{body}').encode())
+                for _ in range(400):
+                    if self.upstream.calls:
+                        break
+                    gate.closed.wait(0.02)
+            gate.push(chunk('late'), {'model': 'm', 'choices': [{'delta': {}, 'finish_reason': 'stop'}]})
+            self.assertTrue(gate.closed.wait(5))
+        self.assertNotIn('Traceback', err.getvalue())
+        self.assertNotIn('internal error', err.getvalue())
+
 
 class RequestHygieneTests(ApiCase):
     def head(self, *lines):
