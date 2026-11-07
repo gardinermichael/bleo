@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -326,9 +327,24 @@ def upstream_error(error):
         return ApiError(502, str(error) or 'Upstream error', type_='upstream_error', code='upstream_error')
     if isinstance(error, ValueError):
         return ApiError(400, str(error), code='invalid_request')
+    if isinstance(error, TimeoutError):
+        return ApiError(504, 'Upstream timed out', type_='upstream_error', code='upstream_timeout')
     if isinstance(error, (OSError, HTTPException)):
         return ApiError(502, 'Upstream connection failed', type_='upstream_error', code='upstream_unavailable')
     return None
+
+
+class _ClientGone(Exception):
+    """The client socket failed while we wrote to or read from it: a real disconnect."""
+
+
+@contextmanager
+def _client_io():
+    """Wrap client-socket I/O only. Upstream errors must never pass through here as disconnects."""
+    try:
+        yield
+    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
+        raise _ClientGone from None
 
 
 def _server_error():
@@ -363,7 +379,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._route(method)
         except ApiError as error:
             self._reply_error(error)
-        except (BrokenPipeError, ConnectionError, TimeoutError):
+        except _ClientGone:
             pass
         except Exception as error:  # noqa: BLE001 - last resort
             _log_internal(error)
@@ -397,8 +413,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header('Connection', 'close')
         for name, value in extra:
             self.send_header(name, value)
-        self.end_headers()
-        self.wfile.write(body)
+        with _client_io():
+            self.end_headers()
+            self.wfile.write(body)
 
     def _drain(self):
         # Closing with unread request bytes can reset the connection before the client reads the error.
@@ -421,7 +438,7 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             self._drain()
             self._send_json(error.status, error.body(), extra)
-        except (BrokenPipeError, ConnectionError, TimeoutError):
+        except _ClientGone:
             pass
 
     def _read_json(self):
@@ -433,7 +450,8 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(raw)
         if length > MAX_BODY_BYTES:
             raise ApiError(413, f'Request body exceeds {MAX_BODY_BYTES} bytes', code='body_too_large')
-        body = self.rfile.read(length)
+        with _client_io():
+            body = self.rfile.read(length)
         self._body_read = True
         if len(body) != length:
             raise ApiError(400, 'Request body is shorter than Content-Length', code='invalid_request')
@@ -460,7 +478,7 @@ class _Handler(BaseHTTPRequestHandler):
                         self._chat_json(client, chunks, limiter, request)
                 finally:
                     chunks.close()
-        except (ApiError, BrokenPipeError, ConnectionError, TimeoutError):
+        except (ApiError, _ClientGone):
             raise
         except Exception as error:  # noqa: BLE001
             mapped = upstream_error(error)
@@ -484,7 +502,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _event(self, payload):
         data = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
-        self.wfile.write(f'data: {data}\n\n'.encode('utf-8'))
+        with _client_io():
+            self.wfile.write(f'data: {data}\n\n'.encode('utf-8'))
 
     def _chat_stream(self, client, chunks, limiter, request):
         pieces = limited(chunks, limiter)
@@ -498,7 +517,8 @@ class _Handler(BaseHTTPRequestHandler):
             for name, value in (('Content-Type', 'text/event-stream'), ('Cache-Control', 'no-cache'),
                                 ('Connection', 'close'), ('X-Accel-Buffering', 'no')):
                 self.send_header(name, value)
-            self.end_headers()
+            with _client_io():
+                self.end_headers()
             self._event(_chunk(completion_id, created, model, {'role': 'assistant', 'content': ''}))
             while True:
                 text, reason = item
@@ -513,7 +533,7 @@ class _Handler(BaseHTTPRequestHandler):
                     self._stream_failure(error)
                     break
             self._event('[DONE]')
-        except (BrokenPipeError, ConnectionError, TimeoutError):
+        except _ClientGone:
             return  # client left; _chat closes the upstream generator
         finally:
             pieces.close()
