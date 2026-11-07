@@ -1,333 +1,638 @@
-"""OpenAI-compatible HTTP API server for bleo.
+"""OpenAI-compatible HTTP API over bleo, built on the Python standard library.
 
-Provides ``GET /v1/models``, ``POST /v1/chat/completions`` (streaming and
-non-streaming), and ``GET /health`` using only the Python standard library.
-Zero third-party dependencies, matching bleo's dependency-free design.
+Routes: ``GET /health`` (open), ``GET /v1/models`` and ``POST /v1/chat/completions``
+(both need ``Authorization: Bearer <token>``). The server always binds 127.0.0.1;
+use ``--tunnel`` to publish it. The token is never printed or logged.
 
-Example::
-
-    bleo-api --gateways "https://ai-chat.bsg.brave.com,https://custom.example.com/v1"
-
-    curl http://127.0.0.1:8317/v1/chat/completions \
-      -H "Content-Type: application/json" \
-      -d '{"model": "luna", "messages": [{"role": "user", "content": "hello"}]}'
+Each request builds its own ``Bleo`` through ``make_client`` and its own message list, so
+conversations, cookies and the reported model never mix between requests. Nothing in a
+request body can change credentials, proxy, gateways or routing.
 """
 
 from __future__ import annotations
 
+import argparse
+import hmac
 import json
+import os
+import secrets
+import signal
+import sys
+import threading
 import time
 import uuid
+from dataclasses import dataclass
+from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Optional
+from pathlib import Path
+from urllib.parse import urlsplit
 
-from . import (
-    APIError,
-    AuthError,
-    Bleo,
-    BleoError,
-    GatewayExhaustedError,
-    RatelimitError,
-    list_models,
-    model_info,
-    resolve_model,
-)
-from .cli import _parse_gateways
+from . import tunnel
+from .client import Bleo
+from .exceptions import AuthError, BleoError, RatelimitError
+from .models import list_models, resolve_model
 
-_DEFAULT_HOST = "127.0.0.1"
-_DEFAULT_PORT = 8317
-_REQUEST_ID_PREFIX = "chatcmpl-"
+HOST = '127.0.0.1'
+DEFAULT_PORT = 8317
+MAX_BODY_BYTES = 20 * 1024 * 1024
+MAX_DRAIN_BYTES = 1024 * 1024
+CHARS_PER_TOKEN = 4
+MAX_STOP_SEQUENCES = 4
+SOCKET_TIMEOUT = 60.0
 
-
-def _now() -> int:
-    return int(time.time())
-
-
-def _chat_completion_id() -> str:
-    return f"{_REQUEST_ID_PREFIX}{uuid.uuid4().hex[:24]}"
+_ROLES = ('system', 'user', 'assistant')
+# Rejected whenever present and not null.
+_REJECTED_PARAMS = ('tools', 'tool_choice', 'functions', 'function_call',
+                    'parallel_tool_calls', 'top_logprobs')
+_CHAT_PATHS = ('/v1/chat/completions', '/chat/completions')
+_MODEL_PATHS = ('/v1/models', '/models')
 
 
-def _error_response(message: str, status_code: int, type_: str = "api_error") -> bytes:
-    body = json.dumps(
-        {
-            "error": {
-                "message": message,
-                "type": type_,
-                "param": None,
-                "code": status_code,
-            }
-        }
-    ).encode("utf-8")
-    return body
+def make_client(model):
+    """Return a fresh, request-local client. Replace this to inject shared routing."""
+    return Bleo(model=model)
 
 
-def _models_list() -> list[dict]:
-    """Return OpenAI-style model objects from bleo's catalog."""
-    out: list[dict] = []
-    for name in list_models():
-        info = model_info(name) or {}
-        out.append(
-            {
-                "id": name,
-                "object": "model",
-                "created": _now(),
-                "owned_by": "brave",
-                "info": info,
-            }
-        )
-    return out
+class ApiError(Exception):
+    def __init__(self, status, message, *, param=None, code=None, type_='invalid_request_error',
+                 retry_after=None):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+        self.param = param
+        self.code = code
+        self.type = type_
+        self.retry_after = retry_after
+
+    def body(self):
+        return {'error': {'message': self.message, 'type': self.type,
+                          'param': self.param, 'code': self.code}}
+
+
+# ── token ────────────────────────────────────────────────────────────────
+
+def bleo_home():
+    return Path(os.environ.get('BLEO_HOME') or Path.home() / '.bleo')
+
+
+def token_path():
+    return bleo_home() / 'api-token'
+
+
+def _env_token():
+    return (os.environ.get('BLEO_API_TOKEN') or '').strip()
+
+
+def load_token():
+    """Return the API token: BLEO_API_TOKEN, else the token file (created on first use)."""
+    env = _env_token()
+    if env:
+        return env
+    path = token_path()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        token = path.read_text(encoding='utf-8').strip()
+        if not token:
+            raise BleoError(f'API token file {path} is empty; delete it to generate a new token') from None
+        if path.stat().st_mode & 0o077:
+            path.chmod(0o600)
+        return token
+    token = secrets.token_urlsafe(32)
+    with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+        handle.write(token + '\n')
+    return token
+
+
+def _token_source():
+    return 'set by BLEO_API_TOKEN' if _env_token() else f'file {token_path()}'
+
+
+# ── request parsing ──────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ChatRequest:
+    model: str
+    messages: tuple
+    stream: bool
+    stop: tuple
+    max_tokens: int | None
+
+
+def _bad(message, param, code='invalid_value'):
+    return ApiError(400, message, param=param, code=code)
+
+
+def _unsupported(message, param):
+    return ApiError(400, message, param=param, code='unsupported_parameter')
+
+
+def _parse_part(part, where, role):
+    if not isinstance(part, dict):
+        raise _bad('Content parts must be objects', where)
+    kind = part.get('type')
+    if kind == 'text' and isinstance(part.get('text'), str):
+        return {'type': 'text', 'text': part['text']}
+    if kind == 'image_url':
+        image = part.get('image_url')
+        url = image.get('url') if isinstance(image, dict) else image
+        if role != 'user':
+            raise _bad('Images are only allowed in user messages', where)
+        if not isinstance(url, str) or not url:
+            raise _bad("'image_url' needs a url string", where)
+        return {'type': 'image_url', 'image_url': {'url': url}}
+    raise _unsupported("Content parts must be 'text' or 'image_url'", f'{where}.type')
+
+
+def _parse_content(content, where, role):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list) and content:
+        return [_parse_part(part, f'{where}[{index}]', role) for index, part in enumerate(content)]
+    raise _bad('Content must be a string or a non-empty list of parts', where)
+
+
+def _parse_messages(value):
+    if not isinstance(value, list) or not value:
+        raise _bad("'messages' must be a non-empty array", 'messages')
+    messages = []
+    for index, message in enumerate(value):
+        where = f'messages[{index}]'
+        if not isinstance(message, dict):
+            raise _bad('Each message must be an object', where)
+        role = message.get('role')
+        if role in ('tool', 'function'):
+            raise _unsupported(f"Role '{role}' is not supported", f'{where}.role')
+        if role not in _ROLES:
+            raise _bad("Role must be 'system', 'user' or 'assistant'", f'{where}.role')
+        for field in ('tool_calls', 'function_call'):
+            if message.get(field):
+                raise _unsupported(f"'{field}' is not supported", f'{where}.{field}')
+        messages.append({'role': role, 'content': _parse_content(message.get('content'), f'{where}.content', role)})
+    return tuple(messages)
+
+
+def _parse_model(value, default):
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise _bad("'model' must be a string", 'model')
+    resolved = resolve_model(value) if value.strip() else None
+    if resolved not in list_models():
+        raise ApiError(400, f'Unknown model: {value[:80]!r}', param='model', code='model_not_found')
+    return resolved
+
+
+def _parse_stop(value):
+    if value is None:
+        return ()
+    stops = [value] if isinstance(value, str) else value
+    if (not isinstance(stops, list) or not stops or len(stops) > MAX_STOP_SEQUENCES
+            or not all(isinstance(item, str) and item for item in stops)):
+        raise _bad(f"'stop' must be a non-empty string or up to {MAX_STOP_SEQUENCES} non-empty strings", 'stop')
+    return tuple(stops)
+
+
+def _parse_max_tokens(payload):
+    limits = []
+    for name in ('max_tokens', 'max_completion_tokens'):
+        value = payload.get(name)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise _bad(f"'{name}' must be a positive integer", name)
+        limits.append(value)
+    return min(limits) if limits else None
+
+
+def _check_unsupported(payload):
+    for name in _REJECTED_PARAMS:
+        if payload.get(name) is not None:
+            raise _unsupported(f"'{name}' is not supported", name)
+    if payload.get('logprobs') not in (None, False):
+        raise _unsupported("'logprobs' is not supported", 'logprobs')
+    count = payload.get('n')
+    if count is not None and (isinstance(count, bool) or not isinstance(count, int) or count != 1):
+        raise _unsupported('Only n=1 is supported', 'n')
+    fmt = payload.get('response_format')
+    if fmt is not None and not (isinstance(fmt, dict) and fmt.get('type') == 'text'):
+        raise _unsupported("Only response_format type 'text' is supported", 'response_format')
+
+
+def parse_chat_request(payload, default_model):
+    if not isinstance(payload, dict):
+        raise ApiError(400, 'Request body must be a JSON object', code='invalid_request')
+    _check_unsupported(payload)
+    stream = payload.get('stream')
+    if stream is not None and not isinstance(stream, bool):
+        raise _bad("'stream' must be a boolean", 'stream')
+    return ChatRequest(model=_parse_model(payload.get('model'), default_model),
+                       messages=_parse_messages(payload.get('messages')),
+                       stream=bool(stream), stop=_parse_stop(payload.get('stop')),
+                       max_tokens=_parse_max_tokens(payload))
+
+
+def _is_quick_tunnel(headers):
+    values = [headers.get('Host', '')] + headers.get('X-Forwarded-Host', '').split(',')
+    for value in values:
+        host = value.strip().lower()
+        if host.count(':') == 1:
+            host = host.rsplit(':', 1)[0]
+        if host.endswith(tunnel.QUICK_TUNNEL_HOST_SUFFIX):
+            return True
+    return False
+
+
+# ── output limits ────────────────────────────────────────────────────────
+
+class Limiter:
+    """Cut text at a stop sequence or an approximate token limit; one per request."""
+
+    def __init__(self, stop, max_tokens):
+        self._stop = stop
+        self._hold = max((len(item) for item in stop), default=1) - 1
+        self._max_chars = None if max_tokens is None else max_tokens * CHARS_PER_TOKEN
+        self._buffer = ''
+        self._emitted = 0
+
+    def _cap(self, text, reason):
+        if self._max_chars is not None:
+            room = self._max_chars - self._emitted
+            if len(text) > room:
+                text, reason = text[:room], 'length'
+            elif reason is None and len(text) == room and self._buffer:
+                reason = 'length'
+        self._emitted += len(text)
+        return text, reason
+
+    def feed(self, chunk):
+        """Return (text to emit, finish reason or None)."""
+        self._buffer += chunk
+        hits = [hit for hit in (self._buffer.find(item) for item in self._stop) if hit >= 0]
+        if hits:
+            text, self._buffer = self._buffer[:min(hits)], ''
+            return self._cap(text, 'stop')
+        cut = len(self._buffer) - min(self._hold, len(self._buffer))
+        text, self._buffer = self._buffer[:cut], self._buffer[cut:]
+        return self._cap(text, None)
+
+    def flush(self):
+        text, self._buffer = self._buffer, ''
+        return self._cap(text, None)
+
+
+def limited(chunks, limiter):
+    """Yield (text, reason); the item carrying a reason is always the last."""
+    for chunk in chunks:
+        text, reason = limiter.feed(chunk)
+        if reason:
+            yield text, reason
+            return
+        if text:
+            yield text, None
+    text, reason = limiter.flush()
+    yield text, reason or 'stop'
+
+
+# ── errors ───────────────────────────────────────────────────────────────
+
+def _log_internal(error):
+    # Only the exception type: messages and tracebacks could carry request data.
+    print(f'bleo-api: internal error: {type(error).__name__}', file=sys.stderr, flush=True)
+
+
+def upstream_error(error):
+    """Map an exception from the upstream path to an ApiError, or None if it is not one."""
+    if isinstance(error, AuthError):
+        return ApiError(502, 'Upstream authentication failed; check bleo service credentials',
+                        type_='upstream_error', code='upstream_auth_failed')
+    if isinstance(error, RatelimitError):
+        return ApiError(429, str(error) or 'Upstream rate limit reached', type_='rate_limit_error',
+                        code='rate_limit_exceeded', retry_after=error.retry_after)
+    if isinstance(error, BleoError):
+        return ApiError(502, str(error) or 'Upstream error', type_='upstream_error', code='upstream_error')
+    if isinstance(error, ValueError):
+        return ApiError(400, str(error), code='invalid_request')
+    if isinstance(error, (OSError, HTTPException)):
+        return ApiError(502, 'Upstream connection failed', type_='upstream_error', code='upstream_unavailable')
+    return None
+
+
+def _server_error():
+    return ApiError(500, 'Internal server error', type_='server_error', code='internal_error')
+
+
+# ── server ───────────────────────────────────────────────────────────────
+
+def _chunk(completion_id, created, model, delta, finish=None):
+    return {'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model,
+            'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish}]}
 
 
 class _Handler(BaseHTTPRequestHandler):
-    server_version = "bleo-api/0.2.0"
+    server_version = 'bleo-api'
+    timeout = SOCKET_TIMEOUT
 
-    def log_message(self, format, *args):  # noqa: A002 - shadows builtin, stdlib signature
-        # Suppress default stderr logging; keep it quiet for embedded use.
+    def log_message(self, format, *args):  # noqa: A002 - stdlib signature
+        # Requests are never logged: paths and headers can carry the token.
         return
 
-    # ── helpers ──────────────────────────────────────────────────────────
+    def do_GET(self):  # noqa: N802
+        self._dispatch('GET')
 
-    def _send_json(self, status: int, payload: dict) -> None:
-        data = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+    def do_POST(self):  # noqa: N802
+        self._dispatch('POST')
 
-    def _send_error(self, status: int, message: str, type_: str = "api_error") -> None:
-        body = _error_response(message, status, type_)
+    def _dispatch(self, method):
+        self._streaming = False
+        self._body_read = False
+        try:
+            self._route(method)
+        except ApiError as error:
+            self._reply_error(error)
+        except (BrokenPipeError, ConnectionError, TimeoutError):
+            pass
+        except Exception as error:  # noqa: BLE001 - last resort
+            _log_internal(error)
+            self._reply_error(_server_error())
+
+    def _route(self, method):
+        path = urlsplit(self.path).path
+        if method == 'GET' and path == '/health':
+            return self._send_json(200, {'status': 'ok'})
+        self._authenticate()
+        if method == 'GET' and path in _MODEL_PATHS:
+            return self._send_json(200, {'object': 'list', 'data': [
+                {'id': name, 'object': 'model', 'created': 0, 'owned_by': 'brave'} for name in list_models()]})
+        if method == 'POST' and path in _CHAT_PATHS:
+            return self._chat()
+        raise ApiError(404, 'Not found', type_='not_found_error', code='not_found')
+
+    def _authenticate(self):
+        scheme, _, credential = self.headers.get('Authorization', '').partition(' ')
+        good = hmac.compare_digest(credential.strip().encode('utf-8'), self.server.token.encode('utf-8'))
+        if scheme.lower() != 'bearer' or not good:
+            raise ApiError(401, 'Missing or invalid API token', type_='authentication_error',
+                           code='invalid_api_key')
+
+    # replies
+    def _send_json(self, status, payload, extra=()):
+        body = json.dumps(payload).encode('utf-8')
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Connection', 'close')
+        for name, value in extra:
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
-    def _read_body(self) -> bytes:
-        length = int(self.headers.get("Content-Length", 0))
-        return self.rfile.read(length) if length else b""
-
-    # ── routes ───────────────────────────────────────────────────────────
-
-    def do_GET(self) -> None:  # noqa: N802 - stdlib interface requires do_GET
-        path = self.path.split("?", 1)[0]
-        if path == "/health":
-            self._send_json(200, {"status": "ok", "service": "bleo-api"})
+    def _drain(self):
+        # Closing with unread request bytes can reset the connection before the client reads the error.
+        raw = self.headers.get('Content-Length', '')
+        if self._body_read or not (raw.isascii() and raw.isdigit()) or int(raw) > MAX_DRAIN_BYTES:
             return
-        if path in ("/v1/models", "/models"):
-            self._send_json(200, {"object": "list", "data": _models_list()})
-            return
-        self._send_error(404, "Not found")
-
-    def do_POST(self) -> None:  # noqa: N802 - stdlib interface requires do_POST
-        path = self.path.split("?", 1)[0]
-        if path != "/v1/chat/completions" and path != "/chat/completions":
-            self._send_error(404, "Not found")
-            return
-
         try:
-            raw = self._read_body()
-            if not raw:
-                self._send_error(400, "Empty request body")
-                return
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            self._send_error(400, "Invalid JSON body")
+            self.rfile.read(int(raw))
+        except OSError:
+            pass
+
+    def _reply_error(self, error):
+        if self._streaming:
             return
-
-        if not isinstance(payload, dict):
-            self._send_error(400, "Request body must be a JSON object")
-            return
-
-        model = payload.get("model", resolve_model(None))
-        messages = payload.get("messages", [])
-        stream = bool(payload.get("stream", False))
-
-        # Validate messages
-        if not isinstance(messages, list) or not messages:
-            self._send_error(400, "'messages' must be a nonempty array")
-            return
-
-        # Extract the last user message content as the prompt.
-        # bleo's ask()/stream() accept a string prompt or content blocks;
-        # conversation history is managed per-client via the history flag.
-        user_contents = [
-            m.get("content", "") for m in reversed(messages)
-            if isinstance(m, dict) and m.get("role") == "user"
-        ]
-        if not user_contents:
-            self._send_error(400, "No user message found in 'messages'")
-            return
-        prompt = user_contents[0]
-        if isinstance(prompt, list):
-            # Content blocks (e.g. image + text) — pass through as-is.
-            prompt = prompt
-        elif not isinstance(prompt, str):
-            self._send_error(400, "User message content must be a string or content blocks")
-            return
-
-        # Build bleo kwargs from OpenAI-compatible fields
-        bleo_kwargs: dict = {}
-        for key in ("x_brave_key", "pre_shared_key", "signing_key_id",
-                    "premium_credential", "proxy"):
-            if key in payload and payload[key] is not None:
-                bleo_kwargs[key] = payload[key]
-
-        gateways_raw = payload.get("gateways")
-        if gateways_raw:
-            bleo_kwargs["gateways"] = _parse_gateways(gateways_raw) if isinstance(gateways_raw, str) else list(gateways_raw)
-        for key in ("gateway_cooldown", "gateway_max_cooldown", "gateway_max_failures"):
-            if key in payload and payload[key] is not None:
-                bleo_kwargs[key] = payload[key]
-
+        extra = []
+        if error.status == 401:
+            extra.append(('WWW-Authenticate', 'Bearer'))
+        if error.retry_after is not None:
+            extra.append(('Retry-After', str(int(error.retry_after) + 1)))
         try:
-            with Bleo(model=model, **bleo_kwargs) as client:
-                if stream:
-                    self._stream_response(client, prompt, model)
-                else:
-                    self._nonstream_response(client, prompt, model)
-        except GatewayExhaustedError as error:
-            self._send_error(503, str(error), "gateway_exhausted")
-        except AuthError as error:
-            self._send_error(401, str(error), "auth_error")
-        except RatelimitError as error:
-            self._send_error(429, str(error), "rate_limit_error")
-        except APIError as error:
-            status = error.status_code or 502
-            self._send_error(status, str(error), "api_error")
-        except (BleoError, ValueError, OSError) as error:
-            self._send_error(502, str(error), "api_error")
+            self._drain()
+            self._send_json(error.status, error.body(), extra)
+        except (BrokenPipeError, ConnectionError, TimeoutError):
+            pass
 
-    # ── response handlers ───────────────────────────────────────────────
-
-    def _nonstream_response(self, client: Bleo, prompt: str, model: str) -> None:
+    def _read_json(self):
+        if 'chunked' in self.headers.get('Transfer-Encoding', '').lower():
+            raise ApiError(400, 'Chunked request bodies are not supported', code='invalid_request')
+        raw = self.headers.get('Content-Length')
+        if raw is None or not (raw.isascii() and raw.isdigit()):
+            raise ApiError(400, 'A valid Content-Length header is required', code='invalid_content_length')
+        length = int(raw)
+        if length > MAX_BODY_BYTES:
+            raise ApiError(413, f'Request body exceeds {MAX_BODY_BYTES} bytes', code='body_too_large')
+        body = self.rfile.read(length)
+        self._body_read = True
+        if len(body) != length:
+            raise ApiError(400, 'Request body is shorter than Content-Length', code='invalid_request')
         try:
-            text = client.ask(prompt)
-        except Exception:
-            # Re-raise so the outer try/except in do_POST handles it.
+            return json.loads(body)
+        except (ValueError, RecursionError):
+            raise ApiError(400, 'Invalid JSON body', code='invalid_json') from None
+
+    # chat
+    def _chat(self):
+        request = parse_chat_request(self._read_json(), self.server.default_model)
+        if request.stream and _is_quick_tunnel(self.headers):
+            raise ApiError(400, 'Cloudflare quick tunnels do not support streaming; use stream=false '
+                                'or a named tunnel', param='stream', code='streaming_unsupported')
+        limiter = Limiter(request.stop, request.max_tokens)
+        try:
+            with make_client(request.model) as client:
+                chunks = client.complete(list(request.messages), model=request.model)
+                try:
+                    if request.stream:
+                        self._chat_stream(client, chunks, limiter, request)
+                    else:
+                        self._chat_json(client, chunks, limiter, request)
+                finally:
+                    chunks.close()
+        except (ApiError, BrokenPipeError, ConnectionError, TimeoutError):
             raise
+        except Exception as error:  # noqa: BLE001
+            mapped = upstream_error(error)
+            if mapped is None:
+                raise
+            raise mapped from None
 
-        completion_id = _chat_completion_id()
-        payload = {
-            "id": completion_id,
-            "object": "chat.completion",
-            "created": _now(),
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
-                }
-            ],
-        }
-        self._send_json(200, payload)
+    @staticmethod
+    def _served(client, request):
+        return client.last_model or request.model
 
-    def _stream_response(self, client: Bleo, prompt: str, model: str) -> None:
-        completion_id = _chat_completion_id()
+    def _chat_json(self, client, chunks, limiter, request):
+        parts, reason = [], 'stop'
+        for text, reason in limited(chunks, limiter):
+            parts.append(text)
+        self._send_json(200, {
+            'id': f'chatcmpl-{uuid.uuid4().hex[:24]}', 'object': 'chat.completion',
+            'created': int(time.time()), 'model': self._served(client, request),
+            'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': ''.join(parts)},
+                         'finish_reason': reason}]})
 
-        def sse_event(data: dict) -> str:
-            return "data: " + json.dumps(data, ensure_ascii=False) + "\n\n"
+    def _event(self, payload):
+        data = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+        self.wfile.write(f'data: {data}\n\n'.encode('utf-8'))
 
-        # Open SSE stream
-        first = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": _now(),
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {"role": "assistant", "content": ""},
-                    "finish_reason": None,
-                }
-            ],
-        }
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
-        self.wfile.write(sse_event(first).encode("utf-8"))
-
+    def _chat_stream(self, client, chunks, limiter, request):
+        pieces = limited(chunks, limiter)
         try:
-            for chunk in client.stream(prompt):
-                event = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": _now(),
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"content": chunk},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                self.wfile.write(sse_event(event).encode("utf-8"))
-        except GeneratorExit:
-            # Client disconnected mid-stream; history is intentionally not committed.
-            return
-        except Exception:
-            # Propagate so the outer handler can log / respond if still connected.
-            raise
+            # Prime before sending headers so early upstream failures are real HTTP errors.
+            item = next(pieces)
+            completion_id, created = f'chatcmpl-{uuid.uuid4().hex[:24]}', int(time.time())
+            model = self._served(client, request)
+            self._streaming = True
+            self.send_response(200)
+            for name, value in (('Content-Type', 'text/event-stream'), ('Cache-Control', 'no-cache'),
+                                ('Connection', 'close'), ('X-Accel-Buffering', 'no')):
+                self.send_header(name, value)
+            self.end_headers()
+            self._event(_chunk(completion_id, created, model, {'role': 'assistant', 'content': ''}))
+            while True:
+                text, reason = item
+                if text:
+                    self._event(_chunk(completion_id, created, model, {'content': text}))
+                if reason:
+                    self._event(_chunk(completion_id, created, model, {}, reason))
+                    break
+                try:
+                    item = next(pieces)
+                except Exception as error:  # noqa: BLE001 - reported to the client as an SSE event
+                    self._stream_failure(error)
+                    break
+            self._event('[DONE]')
+        except (BrokenPipeError, ConnectionError, TimeoutError):
+            return  # client left; _chat closes the upstream generator
+        finally:
+            pieces.close()
 
-        # Terminal [DONE]
+    def _stream_failure(self, error):
+        mapped = upstream_error(error)
+        if mapped is None:
+            _log_internal(error)
+            mapped = _server_error()
+        self._event(mapped.body())
 
 
-def run(
-    host: str = _DEFAULT_HOST,
-    port: int = _DEFAULT_PORT,
-    *,
-    gateways: Optional[list[str]] = None,
-    gateway_cooldown: float = 5.0,
-    gateway_max_cooldown: float = 120.0,
-    gateway_max_failures: int = 5,
-) -> None:
-    """Start the blocking HTTP API server.
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
 
-    Parameters mirror ``Bleo`` constructor args so each request can use the
-    same gateway pool configuration.
-    """
-    server = ThreadingHTTPServer((host, port), _Handler)
-    print(f"bleo-api listening on http://{host}:{port}")
+    def __init__(self, port, token, default_model):
+        if not token:
+            raise ValueError('an API token is required')
+        super().__init__((HOST, port), _Handler)
+        self.token = token
+        self.default_model = default_model
+
+    def handle_error(self, request, client_address):
+        error = sys.exc_info()[1]
+        if not isinstance(error, (ConnectionError, TimeoutError)):
+            _log_internal(error)
+
+
+def create_server(port=DEFAULT_PORT, *, token, default_model=None):
+    """Return a server bound to 127.0.0.1:port (0 picks a free port); call serve_forever()."""
+    return _Server(port, token, resolve_model(default_model))
+
+
+# ── command line ─────────────────────────────────────────────────────────
+
+_make_stop_event = threading.Event
+
+
+def _parser():
+    parser = argparse.ArgumentParser(prog='bleo-api', description='bleo OpenAI-compatible API server (127.0.0.1 only)')
+    parser.add_argument('--port', type=int, default=DEFAULT_PORT, help=f'listen port (default {DEFAULT_PORT})')
+    parser.add_argument('--model', help='default model when a request names none')
+    parser.add_argument('--tunnel', choices=('cloudflare', 'tailscale'), help='publish the API through a tunnel')
+    parser.add_argument('--tunnel-name', help='named Cloudflare tunnel to run (streaming works)')
+    parser.add_argument('--quick', action='store_true', help='Cloudflare quick tunnel (no streaming)')
+    parser.add_argument('--tailscale-port', type=int, default=tunnel.DEFAULT_TAILSCALE_PORT,
+                        help=f'Tailscale HTTPS port (default {tunnel.DEFAULT_TAILSCALE_PORT})')
+    commands = parser.add_subparsers(dest='command')
+    show = commands.add_parser('token', help='show where the API token lives')
+    show.add_argument('--show', action='store_true', help='print the token (terminal only)')
+    return parser
+
+
+def _validate(parser, args):
+    if not 0 <= args.port <= 65535:
+        parser.error('--port must be between 0 and 65535')
+    if args.model and resolve_model(args.model) not in list_models():
+        parser.error(f'unknown model: {args.model}')
+    if args.tunnel != 'cloudflare' and (args.tunnel_name or args.quick):
+        parser.error('--tunnel-name and --quick need --tunnel cloudflare')
+    if args.tunnel != 'tailscale' and args.tailscale_port != tunnel.DEFAULT_TAILSCALE_PORT:
+        parser.error('--tailscale-port needs --tunnel tailscale')
+
+
+def _token_command(args):
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        token = load_token()
+    except (BleoError, OSError) as error:
+        print(f'error: {error}', file=sys.stderr)
+        return 1
+    if not args.show:
+        print(f'API token: {_token_source()}')
+        return 0
+    if not sys.stdout.isatty():
+        print('error: refusing to print the token to a non-terminal; run this in a terminal '
+              'or read the token file directly', file=sys.stderr)
+        return 1
+    print(token)
+    return 0
+
+
+def _start_tunnel(args, port):
+    handle = tunnel.Tunnel(args.tunnel, port, name=args.tunnel_name, quick=args.quick,
+                           https_port=args.tailscale_port,
+                           log=lambda message: print(message, file=sys.stderr, flush=True))
+    try:
+        handle.start()
+    except BaseException:
+        handle.stop()
+        raise
+    print(f'public URL: {handle.url}', flush=True)
+    return handle
+
+
+def _serve(args):
+    server = create_server(args.port, token=load_token(), default_model=args.model)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.05}, daemon=True).start()
+    print(f'bleo-api listening on http://{HOST}:{port}', flush=True)
+    print(f'API token {_token_source()}', flush=True)
+    stop = _make_stop_event()
+    previous = {}
+    if threading.current_thread() is threading.main_thread():
+        for number in (signal.SIGINT, signal.SIGTERM):
+            previous[number] = signal.signal(number, lambda *_: stop.set())
+    handle = None
+    try:
+        if args.tunnel:
+            handle = _start_tunnel(args, port)
+        stop.wait()
     finally:
+        if handle is not None:
+            handle.stop()
+        server.shutdown()
         server.server_close()
+        for number, old in previous.items():
+            signal.signal(number, old)
+    return 0
 
 
-def main() -> None:
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        prog="bleo-api", description="bleo OpenAI-compatible API server"
-    )
-    parser.add_argument("--host", default=_DEFAULT_HOST, help="Bind host (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=_DEFAULT_PORT, help="Bind port (default: 8317)")
-    parser.add_argument("--gateways", help="Comma-separated gateway URLs for rotation/failover")
-    parser.add_argument("--gateway-cooldown", type=float, default=5.0,
-                        help="Base cooldown seconds after a gateway failure (default: 5)")
-    parser.add_argument("--gateway-max-cooldown", type=float, default=120.0,
-                        help="Maximum cooldown seconds (default: 120)")
-    parser.add_argument("--gateway-max-failures", type=int, default=5,
-                        help="Max consecutive failures before a gateway is skipped (default: 5)")
-    args = parser.parse_args()
-
-    gw = _parse_gateways(args.gateways) if args.gateways else None
-    run(
-        host=args.host,
-        port=args.port,
-        gateways=gw,
-        gateway_cooldown=args.gateway_cooldown,
-        gateway_max_cooldown=args.gateway_max_cooldown,
-        gateway_max_failures=args.gateway_max_failures,
-    )
+def main(argv=None):
+    parser = _parser()
+    args = parser.parse_args(argv)
+    _validate(parser, args)
+    if args.command == 'token':
+        return _token_command(args)
+    try:
+        return _serve(args)
+    except (BleoError, OSError) as error:
+        print(f'error: {error}', file=sys.stderr)
+        return 1
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    sys.exit(main())
