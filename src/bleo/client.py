@@ -315,6 +315,15 @@ class Bleo:
             self.history.add_user(prompt)
             self.history.add_assistant(''.join(collected))
 
+    def complete(self, messages, *, model=None, stream=True):
+        """Stream text chunks for OpenAI-style ``messages`` without touching ``history``.
+
+        The caller owns the whole conversation; only ``last_model`` is set, as in ``stream``.
+        """
+        payload = self._build_payload(messages, model=model, stream=stream)
+        self.last_model = None
+        yield from self._stream_with_retry(payload)
+
     def ask(self, prompt, *, remember=None, model=None):
         return ''.join(self.stream(prompt, remember=remember, model=model))
 
