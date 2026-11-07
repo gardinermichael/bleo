@@ -30,6 +30,8 @@ from urllib.parse import urlsplit
 from . import tunnel
 from .client import Bleo
 from .exceptions import AuthError, BleoError, RatelimitError
+from .relay import RelayRouter
+from .relay_state import RelayPool
 from .models import list_models, resolve_model
 
 HOST = '127.0.0.1'
@@ -48,9 +50,19 @@ _CHAT_PATHS = ('/v1/chat/completions', '/chat/completions')
 _MODEL_PATHS = ('/v1/models', '/models')
 
 
-def make_client(model):
-    """Return a fresh, request-local client. Replace this to inject shared routing."""
-    return Bleo(model=model)
+def make_client(model, relays=False):
+    """Return a fresh, request-local client. relays is the server's shared RelayRouter, or
+    False for direct requests (a request never reads the relay file itself)."""
+    return Bleo(model=model, relays=relays)
+
+
+def shared_router(relays=None):
+    """The one router every request shares: None loads the saved pool and returns None when
+    it is empty or off; False means no relays; a RelayRouter is used as given."""
+    if relays is False or isinstance(relays, RelayRouter):
+        return relays or None
+    pool = RelayPool.load()
+    return RelayRouter(pool) if pool.entries and pool.mode != 'off' else None
 
 
 class ApiError(Exception):
@@ -438,7 +450,8 @@ class _Handler(BaseHTTPRequestHandler):
                                 'or a named tunnel', param='stream', code='streaming_unsupported')
         limiter = Limiter(request.stop, request.max_tokens)
         try:
-            with make_client(request.model) as client:
+            shared = {} if self.server.router is None else {'relays': self.server.router}
+            with make_client(request.model, **shared) as client:
                 chunks = client.complete(list(request.messages), model=request.model)
                 try:
                     if request.stream:
@@ -516,12 +529,13 @@ class _Handler(BaseHTTPRequestHandler):
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, port, token, default_model):
+    def __init__(self, port, token, default_model, router=None):
         if not token:
             raise ValueError('an API token is required')
         super().__init__((HOST, port), _Handler)
         self.token = token
         self.default_model = default_model
+        self.router = router
 
     def handle_error(self, request, client_address):
         error = sys.exc_info()[1]
@@ -529,9 +543,13 @@ class _Server(ThreadingHTTPServer):
             _log_internal(error)
 
 
-def create_server(port=DEFAULT_PORT, *, token, default_model=None):
-    """Return a server bound to 127.0.0.1:port (0 picks a free port); call serve_forever()."""
-    return _Server(port, token, resolve_model(default_model))
+def create_server(port=DEFAULT_PORT, *, token, default_model=None, relays=None):
+    """Return a server bound to 127.0.0.1:port (0 picks a free port); call serve_forever().
+
+    relays: None shares one router built from the saved relay pool (none when it is empty or
+    off), False uses no relays, a RelayRouter is shared as given. Fixed at server start.
+    """
+    return _Server(port, token, resolve_model(default_model), shared_router(relays))
 
 
 # ── command line ─────────────────────────────────────────────────────────
