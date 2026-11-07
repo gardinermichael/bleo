@@ -105,6 +105,7 @@ class _Api:
         self.secret = secret
         self.base = base.rstrip("/")
         self.session = Session(timeout=REQUEST_TIMEOUT)
+        self.last_status = None
 
     def close(self):
         self.session.close()
@@ -137,7 +138,7 @@ class _Api:
                 response.raw.close()
         except (OSError, ValueError) as error:
             raise self.fail(action, f"Could not reach {self.platform} to {action}: {type(error).__name__}") from None
-        status = response.status_code
+        status = self.last_status = response.status_code
         if status in (ok or range(200, 300)):
             return _parse(text)
         raise self.fail(action, self._explain(action, status, text))
@@ -220,30 +221,47 @@ def _cloudflare(api, name, environ, progress, wait):
                                f"CLOUDFLARE_ACCOUNT_ID {reason}. Set it to the account id to use.")
         account = chosen[0]["id"]
     scripts = f"/accounts/{quote(account, safe='')}/workers/scripts/{quote(name, safe='')}"
+    # Never overwrite (or later delete) a Worker this run did not create: only a clean 404 means
+    # the name is free. Any other answer, including an error, refuses before anything is uploaded.
+    progress("Checking that the Worker name is free")
+    api.request("GET", scripts, f'check for an existing Worker "{name}"', ok=(200, 404))
+    if api.last_status == 200:
+        raise api.fail("", f'A Worker named "{name}" already exists on this Cloudflare account; '
+                           f"choose another --name.")
     progress("Uploading relay worker to Cloudflare")
     metadata = {"main_module": "index.js", "compatibility_date": COMPATIBILITY_DATE,
                 "bindings": [{"type": "secret_text", "name": SECRET_NAME, "text": api.secret}]}
     body, ctype = _multipart([("index.js", "index.js", "application/javascript+module", _template("cloudflare", "worker.js")),
                               ("metadata", "metadata.json", "application/json", json.dumps(metadata))])
     api.request("PUT", scripts, "upload Worker to Cloudflare", raw=body, content_type=ctype)
-    api.attempt("POST", scripts + "/subdomain", "enable workers.dev routing", data={"enabled": True})
-    progress("Reading workers.dev routing")
+    created = True  # set only after the name was free and the upload succeeded
     try:
+        api.attempt("POST", scripts + "/subdomain", "enable workers.dev routing", data={"enabled": True})
+        progress("Reading workers.dev routing")
         subdomain = _field(api.request("GET", f"/accounts/{quote(account, safe='')}/workers/subdomain",
                                        "retrieve workers.dev subdomain"), "result", "subdomain")
         if not subdomain:
             raise api.fail("", "Worker deployed but workers.dev subdomain is unavailable. Enable a workers.dev "
                                "subdomain for your account in the Cloudflare dashboard.")
     except BaseException:
-        api.attempt("DELETE", scripts, "remove the Worker")
+        if created:
+            api.attempt("DELETE", scripts, "remove the Worker")
         raise
     return f"https://{name}.{subdomain}.workers.dev"
 
 
 def _vercel(api, name, environ, progress, wait):
     progress("Creating Vercel project")
-    project = api.request("POST", "/v11/projects", f'create Vercel project "{name}"',
-                          data={"name": name, "framework": None})
+    # Cleanup below runs only once this call has created the project, so a project that already
+    # had this name is refused here and never deleted.
+    try:
+        project = api.request("POST", "/v11/projects", f'create Vercel project "{name}"',
+                              data={"name": name, "framework": None})
+    except DeployError as error:
+        if "HTTP 409" in str(error):
+            raise api.fail("", f'A Vercel project named "{name}" already exists; choose another --name. '
+                               f"({error})") from None
+        raise
     project_id = _field(project, "id")
     if not project_id:
         raise api.fail("", "Vercel did not return a project id")

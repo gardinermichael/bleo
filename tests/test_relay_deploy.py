@@ -88,7 +88,7 @@ class Platform:
         return b''.join(r.body for r in self.requests).decode()
 
 
-def cloudflare_routes(accounts=None, subdomain='me', fail=None):
+def cloudflare_routes(accounts=None, subdomain='me', fail=None, existing=()):
     accounts = [{'id': 'acc1', 'name': 'Mine'}] if accounts is None else accounts
 
     def route(request):
@@ -97,6 +97,10 @@ def cloudflare_routes(accounts=None, subdomain='me', fail=None):
             return fail[key]
         if key == 'GET /accounts':
             return 200, {'success': True, 'result': accounts}
+        if request.method == 'GET' and request.path.startswith('/accounts/acc1/workers/scripts/'):
+            if request.path.rsplit('/', 1)[1] in existing:
+                return 200, b'// someone else\'s worker'
+            return 404, {'errors': [{'code': 10007, 'message': 'workers.api.error.script_not_found'}]}
         if key == 'GET /accounts/acc1/workers/subdomain':
             return 200, {'result': {'subdomain': subdomain} if subdomain else {}}
         if request.method in ('PUT', 'POST', 'DELETE') and request.path.startswith('/accounts/acc1/workers/scripts/'):
@@ -214,10 +218,10 @@ class CloudflareDeployTests(DeployCase):
         server = self.fake('cloudflare', cloudflare_routes())
         self.assertEqual(self.deploy('cloudflare'), 0, self.everything)
         base = '/accounts/acc1/workers'
-        self.assertEqual(server.calls(), ['GET /accounts', f'PUT {base}/scripts/relay-x',
+        self.assertEqual(server.calls(), ['GET /accounts', f'GET {base}/scripts/relay-x', f'PUT {base}/scripts/relay-x',
                                           f'POST {base}/scripts/relay-x/subdomain', f'GET {base}/subdomain'])
         self.assertAuthorized(server)
-        parts = server.requests[1].parts()
+        parts = server.requests[2].parts()
         metadata = json.loads(parts['metadata'])
         secret = self.pool_secret()
         self.assertEqual(metadata['bindings'], [{'type': 'secret_text', 'name': 'BLEO_RELAY_SECRET', 'text': secret}])
@@ -269,6 +273,37 @@ class CloudflareDeployTests(DeployCase):
         self.assertEqual(server.calls()[-1], 'DELETE /accounts/acc1/workers/scripts/relay-x')
         self.assertEqual(RelayPool.load().entries, ())
         self.assertClean()
+
+    def test_an_existing_worker_name_is_refused_with_no_upload_and_no_delete(self):
+        server = self.fake('cloudflare', cloudflare_routes(existing=('relay-x',)))
+        self.assertEqual(self.deploy('cloudflare'), 1)
+        self.assertIn('already exists on this Cloudflare account', self.err)
+        self.assertIn('--name', self.err)
+        self.assertEqual(server.calls(), ['GET /accounts', 'GET /accounts/acc1/workers/scripts/relay-x'])
+        self.assertEqual(RelayPool.load().entries, ())
+        self.assertClean()
+
+    def test_an_existence_check_error_refuses_and_deletes_nothing(self):
+        check = 'GET /accounts/acc1/workers/scripts/relay-x'
+        for status in (401, 403, 500):
+            with self.subTest(status=status):
+                server = self.fake('cloudflare', cloudflare_routes(fail={check: (status, {'errors': [{'message': 'nope'}]})}))
+                self.assertEqual(self.deploy('cloudflare'), 1)
+                self.assertEqual(server.calls(), ['GET /accounts', check])
+                self.assertEqual(RelayPool.load().entries, ())
+        self.assertClean()
+
+    def test_a_subdomain_lookup_failure_after_a_fresh_upload_deletes_only_the_new_worker(self):
+        lookup = 'GET /accounts/acc1/workers/subdomain'
+        server = self.fake('cloudflare', cloudflare_routes(fail={lookup: (500, {'errors': [{'message': 'flaky'}]})}))
+        self.assertEqual(self.deploy('cloudflare'), 1)
+        script = '/accounts/acc1/workers/scripts/relay-x'
+        calls = server.calls()
+        self.assertEqual(calls[:3], ['GET /accounts', f'GET {script}', f'PUT {script}'])
+        self.assertEqual(calls.count(f'DELETE {script}'), 1)
+        self.assertEqual(calls[-1], f'DELETE {script}')
+        self.assertGreater(calls.index(f'DELETE {script}'), calls.index(f'PUT {script}'))
+        self.assertEqual(RelayPool.load().entries, ())
 
     def test_api_errors_are_clear_and_leave_the_pool_alone(self):
         upload = 'PUT /accounts/acc1/workers/scripts/relay-x'
@@ -331,6 +366,7 @@ class VercelDeployTests(DeployCase):
     def test_api_errors_clean_up_and_leave_the_pool_alone(self):
         cases = [({'POST /v11/projects': (401, {'error': {'message': 'Not authorized'}})}, 'authentication failed', 0),
                  ({'POST /v11/projects': (409, {'error': {'message': 'exists'}})}, '(HTTP 409): exists', 0),
+                 ({'POST /v11/projects': (409, {'error': {'message': 'exists'}})}, 'already exists; choose another --name', 0),
                  ({'POST /v10/projects/prj_1/env': (403, {'error': {'message': 'no env access'}})}, 'no env access', 1),
                  ({'POST /v13/deployments': (500, {'error': {'message': 'boom'}})}, '(HTTP 500): boom', 1)]
         for fail, expected, deletes in cases:
@@ -343,6 +379,13 @@ class VercelDeployTests(DeployCase):
                 if 'env' in expected:
                     self.assertNotIn('POST /v13/deployments', server.calls())  # nothing uploaded without the secret
         self.assertClean()
+
+    def test_an_existing_project_name_is_refused_and_never_deleted(self):
+        server = self.fake('vercel', vercel_routes(fail={'POST /v11/projects': (409, {'error': {'message': 'exists'}})}))
+        self.assertEqual(self.deploy('vercel'), 1)
+        self.assertIn('A Vercel project named "relay-x" already exists', self.err)
+        self.assertEqual(server.calls(), ['POST /v11/projects'])  # nothing created, so nothing deleted
+        self.assertEqual(RelayPool.load().entries, ())
 
     def test_a_failed_build_removes_the_deployment_and_project(self):
         server = self.fake('vercel', vercel_routes(polls=('ERROR',)))
