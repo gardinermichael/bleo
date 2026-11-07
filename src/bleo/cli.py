@@ -420,13 +420,9 @@ def _relay_deploy(args, ui) -> int:
     del token  # the token is only ever held in this call
     pool = RelayPool.load()
     if old:
-        pool.remove(old.label)
-    try:
+        entry = pool.replace(old.label, url, auth=secret, label=label)
+    else:
         entry = pool.add(url, auth=secret, label=label)
-    except ValueError:
-        if old:
-            pool.add(old.url, auth=old.auth, label=old.label)
-        raise
     print(f"platform: {args.platform}")
     print(f"name: {name}")
     print(f"url: {entry.url}")

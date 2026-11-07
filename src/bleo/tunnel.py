@@ -173,7 +173,9 @@ class Tunnel:
 
     def start(self):
         if self.kind == 'cloudflare':
-            self.url = self._start_cloudflare()
+            value = self._start_cloudflare()
+            # A named tunnel's public hostname lives in Cloudflare's DNS, not in cloudflared's output.
+            self.url = value if self.quick else None
         else:
             self.url = self._start_tailscale()
         return self.url

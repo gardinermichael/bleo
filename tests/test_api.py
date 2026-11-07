@@ -801,7 +801,7 @@ class TunnelWiringTests(unittest.TestCase):
 
     def test_named_cloudflare_tunnel_starts_after_listening_and_stops_on_exit(self):
         mock = Mock()
-        mock.return_value.url = 'named tunnel mine'
+        mock.return_value.url = None
         code, out, _ = self.run_main(['--port', '0', '--tunnel', 'cloudflare', '--tunnel-name', 'mine'], mock)
         port = int(out.split('listening on http://127.0.0.1:')[1].split()[0].split(':')[-1])
         args, kwargs = mock.call_args
@@ -809,8 +809,9 @@ class TunnelWiringTests(unittest.TestCase):
         self.assertEqual((kwargs['name'], kwargs['quick'], kwargs['https_port']), ('mine', False, 8443))
         mock.return_value.start.assert_called_once_with()
         mock.return_value.stop.assert_called_once_with()
-        self.assertIn('public URL: named tunnel mine', out)
-        self.assertLess(out.index('listening'), out.index('public URL'))
+        self.assertIn('named tunnel mine connected', out)
+        self.assertIn('cloudflared tunnel route dns mine <hostname>', out)
+        self.assertLess(out.index('listening'), out.index('named tunnel mine connected'))
 
     def test_quick_and_tailscale_options_are_passed_through(self):
         mock = Mock()
@@ -855,6 +856,40 @@ class TunnelWiringTests(unittest.TestCase):
         timer.join()
         self.assertEqual(code, 0)
         mock.return_value.stop.assert_called_once_with()
+
+
+
+class ReviewFixTests(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.TemporaryDirectory()
+        self.addCleanup(self.home.cleanup)
+        patch.dict(os.environ, {'BLEO_HOME': self.home.name}, clear=True).start()
+        self.addCleanup(patch.stopall)
+
+    def exhausted(self, cause):
+        try:
+            raise api.RelayExhaustedError('Relays exhausted', last_status=503) from cause
+        except api.RelayExhaustedError as error:
+            return error
+
+    def test_direct_fallback_timeout_is_a_504(self):
+        error = api.upstream_error(self.exhausted(TimeoutError('slow')))
+        self.assertEqual((error.status, error.code), (504, 'upstream_timeout'))
+
+    def test_direct_fallback_connection_failure_is_upstream_unavailable(self):
+        error = api.upstream_error(self.exhausted(ConnectionResetError('reset')))
+        self.assertEqual((error.status, error.code), (502, 'upstream_unavailable'))
+
+    def test_other_exhaustion_stays_an_upstream_error(self):
+        error = api.upstream_error(api.RelayExhaustedError('Relays exhausted and direct fallback is off'))
+        self.assertEqual((error.status, error.code), (502, 'upstream_error'))
+
+    def test_shared_router_uses_the_upstream_timeout(self):
+        from bleo.relay_state import RelayPool
+        RelayPool().add('https://relay.example.com', auth='s')
+        router = api.shared_router()
+        self.assertEqual((router.header_timeout, router.stall_timeout),
+                         (api.UPSTREAM_TIMEOUT, api.UPSTREAM_TIMEOUT))
 
 
 if __name__ == '__main__':

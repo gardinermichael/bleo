@@ -161,6 +161,8 @@ class RelayPool:
     def _reload(self):
         self._mtime = self._disk_mtime()
         if self._mtime == -1:
+            # Deleted: the pool is reset, so a removed file never keeps routing (or its secrets).
+            self._entries, self._mode, self._sticky = (), 'auto', None
             return
         try:
             with open(self.path, encoding='utf-8') as handle:
@@ -278,6 +280,19 @@ class RelayPool:
     # -- writes -------------------------------------------------------------------------
 
     def add(self, url, *, auth, label=None):
+        return self._mutate(self._add_change(url, auth, label))
+
+    def replace(self, old_label_or_url, url, *, auth, label=None):
+        """Remove one relay and add another in a single save: a failed add keeps the old one."""
+        add = self._add_change(url, auth, label)
+
+        def change():
+            self._drop(old_label_or_url)
+            return add()
+
+        return self._mutate(change)
+
+    def _add_change(self, url, auth, label):
         clean = validate_relay_url(url)
         label = (label or '').strip() or None
 
@@ -300,22 +315,21 @@ class RelayPool:
                 else tuple(current) + (entry,)
             return entry
 
-        return self._mutate(change)
+        return change
 
     def remove(self, label_or_url):
         """Remove by exact URL or case-insensitive label. Returns the entry or None."""
+        return self._mutate(lambda: self._drop(label_or_url))
+
+    def _drop(self, label_or_url):
         key = (label_or_url or '').strip()
-
-        def change():
-            found = next((e for e in self._entries if e.url == key or e.label.lower() == key.lower()), None)
-            if found is None:
-                return None
-            self._entries = tuple(e for e in self._entries if e is not found)
-            if self._sticky == found.url:
-                self._sticky = self._entries[0].url if self._entries else None
-            return found
-
-        return self._mutate(change)
+        found = next((e for e in self._entries if e.url == key or e.label.lower() == key.lower()), None)
+        if found is None:
+            return None
+        self._entries = tuple(e for e in self._entries if e is not found)
+        if self._sticky == found.url:
+            self._sticky = self._entries[0].url if self._entries else None
+        return found
 
     def set_sticky(self, url):
         def change():

@@ -30,7 +30,7 @@ from urllib.parse import urlsplit
 
 from . import tunnel
 from .client import Bleo
-from .exceptions import AuthError, BleoError, RatelimitError
+from .exceptions import AuthError, BleoError, RatelimitError, RelayExhaustedError
 from .relay import RelayRouter
 from .relay_state import RelayPool
 from .models import list_models, resolve_model
@@ -42,6 +42,7 @@ MAX_DRAIN_BYTES = 1024 * 1024
 CHARS_PER_TOKEN = 4
 MAX_STOP_SEQUENCES = 4
 SOCKET_TIMEOUT = 60.0
+UPSTREAM_TIMEOUT = 60.0
 
 _ROLES = ('system', 'user', 'assistant')
 # Rejected whenever present and not null.
@@ -63,7 +64,10 @@ def shared_router(relays=None):
     if relays is False or isinstance(relays, RelayRouter):
         return relays or None
     pool = RelayPool.load()
-    return RelayRouter(pool) if pool.entries and pool.mode != 'off' else None
+    if not pool.entries or pool.mode == 'off':
+        return None
+    # Bleo's own timeout, which a router passed in from outside would otherwise bypass.
+    return RelayRouter(pool, header_timeout=UPSTREAM_TIMEOUT, stall_timeout=UPSTREAM_TIMEOUT)
 
 
 class ApiError(Exception):
@@ -323,7 +327,9 @@ def upstream_error(error):
     if isinstance(error, RatelimitError):
         return ApiError(429, str(error) or 'Upstream rate limit reached', type_='rate_limit_error',
                         code='rate_limit_exceeded', retry_after=error.retry_after)
-    if isinstance(error, BleoError):
+    if isinstance(error, RelayExhaustedError) and isinstance(error.__cause__, (OSError, HTTPException)):
+        error = error.__cause__  # the direct fallback's own failure, mapped as it is without relays
+    elif isinstance(error, BleoError):
         return ApiError(502, str(error) or 'Upstream error', type_='upstream_error', code='upstream_error')
     if isinstance(error, ValueError):
         return ApiError(400, str(error), code='invalid_request')
@@ -629,7 +635,11 @@ def _start_tunnel(args, port):
     except BaseException:
         handle.stop()
         raise
-    print(f'public URL: {handle.url}', flush=True)
+    if handle.url:
+        print(f'public URL: {handle.url}', flush=True)
+    else:
+        print(f'named tunnel {args.tunnel_name} connected; public URL: the hostname routed to it '
+              f'(cloudflared tunnel route dns {args.tunnel_name} <hostname>)', flush=True)
     return handle
 
 

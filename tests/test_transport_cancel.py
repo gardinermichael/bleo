@@ -1,3 +1,4 @@
+import errno
 import gzip
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -134,7 +135,7 @@ class CancelTests(TransportTestCase):
         # A connect that never completes: listen backlog filled so SYNs go unanswered is
         # not portable, so exercise the cancel check inside the polling loop instead.
         with patch('bleo._http.select.select', side_effect=lambda r, w, x, t: (time.sleep(t), ([], [], []))[1]), \
-                patch('socket.socket.connect_ex', return_value=36):
+                patch('socket.socket.connect_ex', return_value=errno.EINPROGRESS):
             attempt._conn._create_connection = slow_connect
             runner = Runner(attempt.open)
             runner.start()

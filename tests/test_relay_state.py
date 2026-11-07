@@ -554,5 +554,37 @@ class ValidationTests(unittest.TestCase):
             validate_relay_url('http://user@127.0.0.1', allow_insecure=True)
 
 
+
+class ReviewFixTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = os.path.join(directory.name, 'relays.json')
+
+    def test_deleting_the_file_resets_a_loaded_pool(self):
+        pool = RelayPool(self.path)
+        pool.add('https://a.example.com', auth='s')
+        pool.set_mode('spread')
+        os.unlink(self.path)
+        self.assertEqual((pool.entries, pool.mode, pool.sticky_url), ((), 'auto', None))
+
+    def test_replace_swaps_one_relay_in_a_single_save(self):
+        pool = RelayPool(self.path)
+        pool.add('https://old.example.com', auth='old', label='cf')
+        pool.add('https://keep.example.com', auth='k', label='keep')
+        entry = pool.replace('cf', 'https://new.example.com', auth='new', label='cf')
+        saved = {e.label: (e.url, e.auth) for e in RelayPool.load(self.path).entries}
+        self.assertEqual(entry.url, 'https://new.example.com')
+        self.assertEqual(saved, {'cf': ('https://new.example.com', 'new'), 'keep': ('https://keep.example.com', 'k')})
+
+    def test_a_failed_replace_save_keeps_the_old_relay_on_disk(self):
+        pool = RelayPool(self.path)
+        pool.add('https://old.example.com', auth='old', label='cf')
+        with patch.object(RelayPool, '_write', side_effect=OSError('disk full')):
+            with self.assertRaises(OSError):
+                pool.replace('cf', 'https://new.example.com', auth='new', label='cf')
+        self.assertEqual([e.url for e in RelayPool.load(self.path).entries], ['https://old.example.com'])
+
+
 if __name__ == '__main__':
     unittest.main()

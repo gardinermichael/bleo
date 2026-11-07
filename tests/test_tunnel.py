@@ -163,12 +163,12 @@ class CloudflareTests(unittest.TestCase):
         self.assertTrue(proc.terminated)
         self.assertTrue(any('quick tunnels do not support streaming' in line for line in self.logs))
 
-    def test_named_start_returns_named_text_and_runs_named_command(self):
+    def test_named_start_has_no_url_and_runs_named_command(self):
         proc = FakeProc(stderr=['INF Starting tunnel\n',
                                 'INF Registered tunnel connection connIndex=0\n'])
         runner = FakeRunner(proc=proc)
         with Tunnel('cloudflare', API_PORT, name='bleo', runner=runner, log=self.log) as active:
-            self.assertEqual(active.url, 'named tunnel bleo')
+            self.assertIsNone(active.url)
         self.assertEqual(runner.popen_calls, [tunnel.cloudflare_command(API_PORT, name='bleo')])
         self.assertTrue(proc.terminated)
 

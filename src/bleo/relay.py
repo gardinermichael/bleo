@@ -11,6 +11,7 @@ import queue
 import threading
 import time
 from urllib.parse import urlsplit
+from urllib.request import getproxies, proxy_bypass
 
 from ._http import Attempt
 from .exceptions import RelayExhaustedError
@@ -229,7 +230,8 @@ class RelayRouter:
             extra['header_timeout'] = self.header_timeout
         if self.stall_timeout is not None:
             extra['stall_timeout'] = self.stall_timeout
-        return RelayAttempt(url, method=method, headers=headers, body=body, proxy=self.proxy, **extra)
+        proxy = self.proxy or _env_proxy(url)
+        return RelayAttempt(url, method=method, headers=headers, body=body, proxy=proxy, **extra)
 
     @staticmethod
     def _relay_headers(entry, call):
@@ -350,6 +352,19 @@ class RelayRouter:
             raise RelayExhaustedError(f'Relays exhausted and direct request failed: {_describe(error)}',
                                       last_status=turn.last_status) from error
         return attempt, Route('direct', upstream_url, None)
+
+
+def _env_proxy(url):
+    """The HTTP(S)_PROXY urllib would use for url (honoring NO_PROXY), as Session does."""
+    parts = urlsplit(url)
+    proxy = getproxies().get(parts.scheme)
+    if not proxy or proxy_bypass(parts.hostname or ''):
+        return None
+    if urlsplit(proxy).scheme not in ('http', 'https'):
+        log.warning('ignoring %s proxy from the environment: only HTTP(S) proxies are supported',
+                    urlsplit(proxy).scheme or 'unknown')
+        return None
+    return proxy
 
 
 class _Dead:

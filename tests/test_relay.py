@@ -784,5 +784,36 @@ class CooldownSkipTests(RouterCase):
         self.assertEqual((route.kind, body), ('relay', b'relay'))
 
 
+
+class EnvironmentProxyTests(RouterCase):
+    URL = 'https://brave.example.com/x'
+
+    def proxy_host(self, router, env, bypass=False):
+        with patch('bleo.relay.getproxies', return_value=env), \
+                patch('bleo.relay.proxy_bypass', return_value=bypass):
+            attempt = router._make_attempt(self.URL, 'POST', {}, b'')
+        self.addCleanup(attempt.close)
+        return attempt._conn.host
+
+    def test_uses_the_environment_proxy_when_none_is_given(self):
+        router = self.build()
+        self.assertEqual(self.proxy_host(router, {'https': 'http://corp-proxy:3128'}), 'corp-proxy')
+
+    def test_no_proxy_bypass_goes_direct(self):
+        router = self.build()
+        self.assertEqual(self.proxy_host(router, {'https': 'http://corp-proxy:3128'}, bypass=True),
+                         'brave.example.com')
+
+    def test_an_explicit_proxy_wins_over_the_environment(self):
+        router = self.build(proxy='http://mine:8080')
+        self.assertEqual(self.proxy_host(router, {'https': 'http://corp-proxy:3128'}), 'mine')
+
+    def test_an_unsupported_environment_proxy_is_ignored(self):
+        router = self.build()
+        with self.assertLogs('bleo.relay', 'WARNING'):
+            host = self.proxy_host(router, {'https': 'socks5://corp-proxy:1080'})
+        self.assertEqual(host, 'brave.example.com')
+
+
 if __name__ == '__main__':
     unittest.main()
