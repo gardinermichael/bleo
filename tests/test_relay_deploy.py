@@ -129,8 +129,10 @@ def vercel_routes(fail=None, polls=('QUEUED', 'READY'), url='relay-abc.vercel.ap
     return route
 
 
-def deno_routes(fail=None, revision=None, domains=None):
+def deno_routes(fail=None, revision=None, domains=None, timelines=None):
     revision = revision or {'status': 'succeeded', 'timelines': [{'name': 'Production', 'hostnames': ['relay-x.deno.net']}]}
+    # A list of revisions is answered one per poll, the last one repeating.
+    revisions = list(revision) if isinstance(revision, list) else [revision]
 
     def route(request):
         key = f'{request.method} {request.path}'
@@ -143,7 +145,9 @@ def deno_routes(fail=None, revision=None, domains=None):
         if key == 'POST /apps/app1/deploy':
             return 200, {'id': 'rev1'}
         if key == 'GET /revisions/rev1':
-            return 200, revision
+            return 200, revisions.pop(0) if len(revisions) > 1 else revisions[0]
+        if key == 'GET /revisions/rev1/timelines' and timelines is not None:
+            return 200, timelines
         if key == 'GET /domains':
             return 200, domains or []
         if request.method == 'DELETE':
@@ -167,6 +171,7 @@ class DeployCase(CliRelayCase):
         self.patch(patch('bleo.cli._relay_probe', fake_probe_ok))
         self.patch(patch.dict(relay_deploy.POLL_INTERVAL, {'deno': 0.001, 'vercel': 0.001}))
         self.patch(patch.object(relay_deploy, 'POLL_TIMEOUT', 2.0))
+        self.patch(patch.object(relay_deploy, 'HOSTNAME_WAIT', 0.05))
 
     def patch(self, patcher):
         patcher.start()
@@ -384,6 +389,27 @@ class DenoDeployTests(DeployCase):
         self.assertEqual(self.deploy('deno'), 1)
         self.assertIn('could not determine the public URL', self.err)
         self.assertEqual(server.calls()[-1], 'DELETE /apps/app1')
+
+    def test_waits_for_a_hostname_routed_after_the_build_succeeds(self):
+        routed = {'status': 'succeeded', 'timelines': [{'name': 'Production', 'hostnames': ['relay-x.org.deno.net']}]}
+        self.fake('deno', deno_routes(revision=[{'status': 'succeeded', 'timelines': []},
+                                                 {'status': 'succeeded', 'timelines': []}, routed]))
+        self.assertEqual(self.deploy('deno'), 0)
+        self.assertEqual(RelayPool.load().entries[0].url, 'https://relay-x.org.deno.net')
+
+    def test_reads_the_hostname_from_the_timelines_endpoint(self):
+        self.fake('deno', deno_routes(revision={'status': 'succeeded', 'timelines': []},
+                                      timelines=[{'slug': 'production', 'domains': [{'domain': 'relay-x.org.deno.net'}]}]))
+        self.assertEqual(self.deploy('deno'), 0)
+        self.assertEqual(RelayPool.load().entries[0].url, 'https://relay-x.org.deno.net')
+
+    def test_no_url_says_what_deno_returned(self):
+        self.fake('deno', deno_routes(revision={'status': 'succeeded', 'timelines': [{'name': 'Production'}]},
+                                      timelines=[]))
+        self.assertEqual(self.deploy('deno'), 1)
+        self.assertIn("status 'succeeded'; revision timelines: Production: 0 hostname(s); "
+                      "timelines endpoint: none", self.err)
+        self.assertClean()
 
     def test_api_errors_clean_up_and_leave_the_pool_alone(self):
         cases = [({'POST /apps': (401, b'token rejected')}, 'authentication failed', 0),

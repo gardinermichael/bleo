@@ -4,6 +4,7 @@ from http.client import IncompleteRead
 import base64
 import json
 import os
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -14,7 +15,10 @@ from helpers import Raw, ScriptedTransport, chunk, completion, sse
 
 class ClientTests(unittest.TestCase):
     def setUp(self):
-        self.environment = patch.dict(os.environ, {}, clear=True)
+        # An empty BLEO_HOME keeps the user's saved relays out of these offline tests.
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        self.environment = patch.dict(os.environ, {'BLEO_HOME': home.name}, clear=True)
         self.environment.start()
         self.addCleanup(self.environment.stop)
         self.sleep = patch('bleo.client.time.sleep').start()

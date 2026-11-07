@@ -11,6 +11,14 @@ from helpers import Raw, ScriptedTransport, completion
 
 
 class CliTests(unittest.TestCase):
+    def setUp(self):
+        # An empty BLEO_HOME keeps the user's saved relays out of these offline tests.
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        environment = patch.dict('os.environ', {'BLEO_HOME': home.name})
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def run_cli(self, args, *responses, inputs=()):
         self.output, self.errors = StringIO(), StringIO()
         self.transport = ScriptedTransport(*responses)

@@ -32,6 +32,7 @@ API_BASES = {"cloudflare": "https://api.cloudflare.com/client/v4",
              "vercel": "https://api.vercel.com"}
 POLL_INTERVAL = {"deno": 2.0, "vercel": 3.0}
 POLL_TIMEOUT = 120.0
+HOSTNAME_WAIT = 30.0
 REQUEST_TIMEOUT = 60
 USER_AGENT = "bleo-relay-deploy"
 COMPATIBILITY_DATE = "2024-03-20"
@@ -313,12 +314,18 @@ def _deno(api, name, environ, progress, wait):
             raise api.fail("", "Deno Deploy did not return a revision id")
         progress("Waiting for Deno Deploy build to finish")
         info = wait("deno", lambda: _deno_revision(api, revision_id))
+        seen = {"revision": info}
         host = _deno_host(info)
+        if not host:
+            # A revision can report "succeeded" before a hostname is routed to it.
+            progress("Waiting for Deno Deploy to route a hostname")
+            host = _deno_wait_for_host(api, revision_id, wait, seen)
         if not host:
             host = _deno_managed_domain(api)
             host = f"{name}.{host}" if host else None
         if not host:
-            raise api.fail("", f'Deployed but could not determine the public URL for "{name}". '
+            raise api.fail("", f'Deployed but could not determine the public URL for "{name}" '
+                               f"(Deno returned {_deno_summary(seen)}). "
                                f"Check the app's domain in the Deno Deploy dashboard.")
         return f"https://{host}"
     except BaseException:
@@ -347,6 +354,34 @@ def _deno_host(revision):
     hosts = list(chosen.get("hostnames") or []) + [d.get("domain", "") for d in chosen.get("domains") or []
                                                     if isinstance(d, dict)]
     return next((h for h in hosts if isinstance(h, str) and h), None)
+
+
+def _deno_wait_for_host(api, revision_id, wait, seen):
+    rid = quote(revision_id, safe="")
+
+    def check():
+        revision = api.attempt("GET", f"/revisions/{rid}", "poll Deno Deploy revision")
+        timelines = api.attempt("GET", f"/revisions/{rid}/timelines", "read Deno Deploy timelines")
+        seen["revision"] = revision if isinstance(revision, dict) else seen["revision"]
+        seen["timelines"] = timelines if isinstance(timelines, list) else seen.get("timelines")
+        return _deno_host(seen["revision"] or {}) or _deno_host({"timelines": seen.get("timelines") or []})
+
+    try:
+        return wait("deno", check, timeout=HOSTNAME_WAIT)
+    except DeployError:
+        return None
+
+
+def _deno_summary(seen):
+    """What Deno reported about routing, without values that could be sensitive."""
+    def describe(timelines):
+        items = [t for t in timelines or [] if isinstance(t, dict)]
+        return ", ".join(f"{t.get('name') or t.get('slug') or '?'}: "
+                         f"{len(t.get('hostnames') or []) + len(t.get('domains') or [])} hostname(s)"
+                         for t in items) or "none"
+    revision = seen.get("revision") or {}
+    return (f"status {revision.get('status')!r}; revision timelines: {describe(revision.get('timelines'))}; "
+            f"timelines endpoint: {describe(seen.get('timelines'))}")
 
 
 def _deno_managed_domain(api):
@@ -379,14 +414,15 @@ def deploy(platform, token, name, secret, *, environ=None, progress=None, sleep=
         if secret in _template(platform, relpath):
             raise DeployError("refusing to deploy: the relay secret appears in the relay code")
 
-    def wait(kind, check):
-        deadline = monotonic() + POLL_TIMEOUT
+    def wait(kind, check, timeout=None):
+        timeout = POLL_TIMEOUT if timeout is None else timeout
+        deadline = monotonic() + timeout
         while True:
             result = check()
             if result:
                 return result
             if monotonic() >= deadline:
-                raise DeployError(f"Deployment timed out ({POLL_TIMEOUT:g}s)")
+                raise DeployError(f"Deployment timed out ({timeout:g}s)")
             sleep(POLL_INTERVAL[kind])
 
     api = _Api(platform, token, secret, API_BASES[platform])
