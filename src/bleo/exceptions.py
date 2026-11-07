@@ -41,5 +41,12 @@ class APIError(BleoError):
         self.body = body
 
 
-class GatewayExhaustedError(BleoError):
-    """All gateways are unavailable (cooled-down or over the failure cap)."""
+class RelayExhaustedError(BleoError):
+    """Every relay failed and the direct request to the upstream failed too."""
+
+    def __init__(self, message='', *, last_status=None):
+        super().__init__(message)
+        self.last_status = last_status
+
+
+GatewayExhaustedError = RelayExhaustedError
