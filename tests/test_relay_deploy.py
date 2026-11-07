@@ -447,7 +447,8 @@ class DeployPoolAndTokenTests(DeployCase):
         for name in ('CLOUDFLARE_API_TOKEN', 'DENO_DEPLOY_TOKEN', 'VERCEL_TOKEN'):
             os.environ.pop(name)
         server = self.fake('vercel', vercel_routes())
-        with patch('bleo.relay_deploy.getpass.getpass', return_value=f'  {TOKEN}  ') as prompt:
+        with patch('bleo.relay_deploy._can_prompt', return_value=True), \
+                patch('bleo.relay_deploy.getpass.getpass', return_value=f'  {TOKEN}  ') as prompt:
             self.assertEqual(self.deploy('vercel'), 0)
         prompt.assert_called_once()
         self.assertAuthorized(server)
@@ -458,8 +459,19 @@ class DeployPoolAndTokenTests(DeployCase):
         for name in ('CLOUDFLARE_API_TOKEN', 'DENO_DEPLOY_TOKEN', 'VERCEL_TOKEN'):
             os.environ.pop(name)
         server = self.fake('deno', deno_routes())
-        with patch('bleo.relay_deploy.getpass.getpass', return_value=' '):
+        with patch('bleo.relay_deploy._can_prompt', return_value=True), \
+                patch('bleo.relay_deploy.getpass.getpass', return_value=' '):
             self.assertEqual(self.deploy('deno'), 1)
+        self.assertEqual(server.requests, [])
+
+    def test_without_a_terminal_the_token_is_not_prompted_for(self):
+        for name in ('CLOUDFLARE_API_TOKEN', 'DENO_DEPLOY_TOKEN', 'VERCEL_TOKEN'):
+            os.environ.pop(name)
+        server = self.fake('cloudflare', cloudflare_routes())
+        with patch('bleo.relay_deploy._can_prompt', return_value=False), \
+                patch('bleo.relay_deploy.getpass.getpass') as prompt:
+            self.assertEqual(self.deploy('cloudflare'), 1)
+        prompt.assert_not_called()
         self.assertEqual(server.requests, [])
 
     def test_the_token_and_secret_reach_no_file_but_the_secret_reaches_only_the_pool(self):

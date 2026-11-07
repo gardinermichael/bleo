@@ -15,6 +15,7 @@ import json
 import os
 import re
 import secrets
+import sys
 import time
 from urllib.parse import quote
 
@@ -68,10 +69,18 @@ def platform_name(platform: str, name: str) -> str:
     return clean
 
 
+def _can_prompt() -> bool:
+    return sys.stdin.isatty()
+
+
 def read_token(platform: str, environ=None) -> str:
     """The platform token from its environment variable, else a hidden prompt."""
     environ = os.environ if environ is None else environ
     token = (environ.get(TOKEN_ENV[platform]) or "").strip()
+    if not token and not _can_prompt():
+        # getpass falls back to echoing input without a terminal; refuse instead.
+        raise ValueError(f"no terminal to ask for the {TOKEN_LABEL[platform]}; run this in a terminal "
+                         f"or set {TOKEN_ENV[platform]}")
     if not token:
         token = getpass.getpass(f"{TOKEN_LABEL[platform]} (input hidden; kept in memory only): ").strip()
     if not token:
