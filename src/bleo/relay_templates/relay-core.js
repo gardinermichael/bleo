@@ -117,7 +117,8 @@ async function handleRelay(request, secret, options) {
   DENY_HEADERS.forEach((h) => headers.delete(h));
   headers.delete(RELAY_AUTH_HEADER);
   try {
-    const init = { method: request.method, headers, signal: request.signal };
+    // Never follow redirects: a 3xx goes back to the caller, so credentials never leave the allowlist.
+    const init = { method: request.method, headers, signal: request.signal, redirect: "manual" };
     if (request.method !== "GET" && request.method !== "HEAD") { init.body = request.body; init.duplex = "half"; }
     const response = await fetch(resolved.url, init);
     return new Response(response.body, { status: response.status, headers: response.headers });
