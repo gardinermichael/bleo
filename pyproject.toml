@@ -34,6 +34,7 @@ dependencies = []
 
 [project.scripts]
 bleo = "bleo.cli:main"
+bleo-api = "bleo.api:main"
 
 [project.urls]
 Homepage = "https://github.com/Ninnix/bleo"

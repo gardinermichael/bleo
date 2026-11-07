@@ -101,6 +101,133 @@ The signing key ID must match the pre-shared key. Changing it to match an instal
 
 `max_retries=3` means three total attempts. Only transient failures before output are retried; authentication and other HTTP 4xx errors stop immediately. Rate limits honor `Retry-After` and JSON expiry timestamps. Longer waits than `max_retry_delay=60` raise `RatelimitError` with `retry_after` so callers can schedule another attempt. Streams stop at the first completed answer. Partial, empty, malformed, or truncated replies raise errors and are never replayed. Set `max_retries=1` to disable retries.
 
+## Relays
+
+A relay is a small forwarder you deploy yourself, on Cloudflare Workers, Deno Deploy or Vercel Edge. It forwards only to Brave Leo's two hosts (`ai-chat.bsg.brave.com` and `ai-chat-premium.bsg.brave.com`), and only for requests that carry your shared secret. bleo can spread its requests over several relays.
+
+Deploy one in a single step:
+
+```sh
+bleo relay deploy cloudflare        # or: deno, vercel
+```
+
+It asks for your platform API token (typed hidden, or read from `CLOUDFLARE_API_TOKEN`, `DENO_DEPLOY_TOKEN` or `VERCEL_TOKEN`), makes a fresh secret, uploads the relay to your account through the platform's API, stores the secret there as `BLEO_RELAY_SECRET`, saves the relay in your pool and probes it with no direct fallback. The token is used in memory only: it is never saved, logged or printed. The secret is never part of the uploaded code; bleo keeps it in the pool file for you. If the probe fails, the relay stays in the pool and the command says how to remove it.
+
+Options: `--name NAME` (the name on the platform; default `bleo-relay-` plus six random characters), `--label LABEL` (the pool label; default the platform name), `--replace` (replace an existing relay with that label once the new one is deployed), `--no-probe`. The probe is retried for up to 30 seconds while the new deployment comes up.
+
+- Cloudflare: if your token sees more than one account, set `CLOUDFLARE_ACCOUNT_ID` to choose one. The relay is served from your `workers.dev` subdomain.
+- Vercel: creates a project named after `--name`. The Hobby plan caps origin transfer, and a streaming relay uses a lot of it, so use a paid plan or a project you can afford to lose.
+- Deno Deploy: Deno may rewrite the `User-Agent` header, so check the probe result before you rely on it.
+
+### Manual deploy
+
+If you would rather deploy by hand, create the deployable files for one platform. The command prints a new 64-character secret once; copy it.
+
+```sh
+bleo relay template cloudflare      # or: deno, vercel (writes ./bleo-relay-<platform>)
+```
+
+Then follow that platform's README: [Cloudflare](src/bleo/relay_templates/cloudflare/README.md), [Deno Deploy](src/bleo/relay_templates/deno/README.md) or [Vercel Edge](src/bleo/relay_templates/vercel/README.md). Each one stores the secret as `BLEO_RELAY_SECRET` on the platform. Until that variable is set, the relay answers `500`.
+
+- Cloudflare: `npx wrangler deploy`, then `npx wrangler secret put BLEO_RELAY_SECRET`.
+- Vercel: `vercel deploy --prod`, then `vercel env add BLEO_RELAY_SECRET` and redeploy.
+- Deno Deploy: add `BLEO_RELAY_SECRET` in the app's settings and redeploy if asked.
+
+Add the relay to bleo with the deployed URL and the same secret, then probe it:
+
+```sh
+bleo relay add <deployed-url> --auth <secret> --label home
+bleo relay probe home --no-direct
+bleo relay list
+```
+
+`probe` sends one signed streaming chat through that relay alone, with no direct fallback, and prints the route, HTTP status, seconds to headers, the number of content chunks, the time between the first and last chunk, and whether the UTF-8 reply decoded. It passes only on a 2xx reply served by that relay with at least one content chunk; otherwise it fails with a non-zero exit and makes no direct request. Platform support is confirmed only by a passing probe. If a premium credential is configured, the premium host is probed and reported separately.
+
+Other commands:
+
+- `bleo relay remove <label|url>` removes a relay.
+- `bleo relay mode auto|spread|off` sets the mode. `sticky` is accepted and stored as `auto`. `off` sends every request direct.
+- `bleo relay list` shows labels, URLs and the sticky relay. It never prints a secret.
+- `bleo -v` prints `route: <label or direct>` after each reply.
+
+How requests are routed:
+
+- In `auto`, the sticky relay (the one that last answered successfully) is tried first. Another relay takes its place only after at least three measurements, and only if its average time to headers is more than the larger of 1.5 s and 25% of the sticky relay's average faster.
+- In `spread`, healthy relays take turns on a rotating cursor instead of sticking to one.
+- A relay is rolled past when it answers 408, 429, 502-504, 520-530, 403, 413 or a redirect, or with a relay-side refusal such as a wrong secret (401 `unauthorized`) or a disabled deployment (402). A connection error also counts as a failure. 413 is skipped without a cooldown.
+- After a failure a relay cools down for 30 s by default, 45 s for other 5xx, 60 s for 504, 90 s for 429, and 6 h for a disabled deployment (402). Each consecutive failure multiplies the cooldown, up to four times. A success clears it.
+- If the first relay has not answered within 8 s, the next healthy relay is started too, and the first usable answer wins.
+- When every relay has failed or is cooling down, the request goes direct to Brave, as bleo did before relays existed. Only `probe --no-direct` runs without this fallback.
+- Health is kept in memory for each process. The saved file holds only relays, the mode and the sticky relay.
+
+The pool is stored in `~/.bleo/relays.json` (or under `BLEO_HOME`) with mode 0600. The relay secrets are saved in that file in plain text, so keep the file private.
+
+## OpenAI-compatible API (bleo-api)
+
+`bleo-api` serves bleo through an OpenAI-style chat-completions endpoint, so OpenAI-compatible clients can use it. It listens on `127.0.0.1` only, on port 8317 by default (`--port`).
+
+```sh
+bleo-api                             # http://127.0.0.1:8317
+bleo-api --port 9000 --model luna    # other port, default model for requests that name none
+```
+
+Every route except `GET /health` needs `Authorization: Bearer <token>`. The token is `BLEO_API_TOKEN` if that is set. Otherwise it is read from `~/.bleo/api-token` (under `BLEO_HOME` if set), and created on first use with mode 0600. The server logs only where the token came from, never its value; `token --show` prints it, but only in a terminal.
+
+```sh
+bleo-api token              # shows where the token comes from
+bleo-api token --show       # prints the token; only works in a terminal
+```
+
+To script with the token, read the file rather than capturing `token --show`, which refuses to print to a pipe:
+
+```sh
+TOKEN="$(cat ~/.bleo/api-token)"
+curl http://127.0.0.1:8317/v1/chat/completions \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"model": "luna", "messages": [{"role": "user", "content": "tell me a joke"}]}'
+```
+
+Add `"stream": true` to the body and use `curl -N` to receive server-sent events. Streaming ends with `data: [DONE]`.
+
+From Python, install the `openai` package (it is not a bleo dependency) and point it at the local server:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8317/v1", api_key="<token>")
+reply = client.chat.completions.create(
+    model="luna",
+    messages=[{"role": "user", "content": "hello"}],
+)
+print(reply.choices[0].message.content)
+```
+
+Routes: `GET /health` (no token), `GET /v1/models` and `POST /v1/chat/completions`. The paths without `/v1` also work.
+
+Supported request fields:
+
+- `model`: a model from bleo's catalog, by alias or ID. Without it, the `--model` default or GPT-6 Luna is used.
+- `messages`: roles `system`, `user` and `assistant`. Content is a string or a list of `text` parts. `image_url` parts are allowed in user messages only.
+- `stream`: boolean.
+- `stop`: a string or up to four strings.
+- `max_tokens` or `max_completion_tokens`: when both are given, the smaller applies. The limit is approximate, at four characters per token.
+- `n`: only `1`.
+- `response_format`: only `{"type": "text"}`.
+
+Rejected with `400` and code `unsupported_parameter`: `tools`, `tool_choice`, `functions`, `function_call`, `parallel_tool_calls`, `top_logprobs`, `logprobs` when true, `n` other than 1, a `response_format` other than text, messages with role `tool` or `function` or with `tool_calls` or `function_call`, and content parts other than `text` or `image_url`.
+
+Ignored: any other top-level field, such as `temperature`, `top_p`, `seed` or `user`. It is accepted and has no effect.
+
+## Remote access
+
+`bleo-api` always binds `127.0.0.1`. A tunnel publishes that port, and the public URL is printed when the tunnel starts. The token is still required. Copy it to a client with `bleo-api token --show`, run in a terminal, over a channel you trust.
+
+- Named Cloudflare tunnel, with streaming: `bleo-api --tunnel cloudflare --tunnel-name NAME`. The tunnel must already exist in your `cloudflared` setup, and `cloudflared` must be on `PATH`.
+- Cloudflare quick tunnel: `bleo-api --tunnel cloudflare --quick`. It prints a random `*.trycloudflare.com` URL. Quick tunnels refuse streaming with `400` and code `streaming_unsupported`, so send `"stream": false`.
+- Tailscale: `bleo-api --tunnel tailscale [--tailscale-port 8443]`. It uses `tailscale serve`, so the API is reachable on your tailnet only. bleo refuses a port that already has a Serve mapping and, at exit, removes only the mapping it created.
+
+`--tunnel-name` and `--quick` need `--tunnel cloudflare`. `--tailscale-port` needs `--tunnel tailscale`.
+
 ## Tests
 
 ```sh

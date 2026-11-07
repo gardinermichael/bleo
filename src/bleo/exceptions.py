@@ -39,3 +39,14 @@ class APIError(BleoError):
         super().__init__(message)
         self.status_code = status_code
         self.body = body
+
+
+class RelayExhaustedError(BleoError):
+    """Every relay failed and the direct request to the upstream failed too."""
+
+    def __init__(self, message='', *, last_status=None):
+        super().__init__(message)
+        self.last_status = last_status
+
+
+GatewayExhaustedError = RelayExhaustedError

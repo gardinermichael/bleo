@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import hashlib
 import hmac
 from http.client import HTTPException
@@ -14,7 +15,9 @@ from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from ._http import Session
-from .exceptions import APIError, AuthError, BleoError, RatelimitError
+from .exceptions import APIError, AuthError, BleoError, RatelimitError, RelayExhaustedError
+from .relay import RelayRouter, Route
+from .relay_state import RelayPool
 from .models import DefaultModel, History, Message, Qwen38, Role, list_models, model_info, resolve_model
 
 _BASE = 'https://ai-chat.bsg.brave.com'
@@ -114,11 +117,16 @@ class Bleo:
     The default requested model is GPT-6 Luna. Premium credentials,
     service keys and signing key IDs can be supplied explicitly or via environment.
     max_retries counts total attempts. Long Retry-After delays are raised to the caller.
+
+    relays: None uses the saved relay pool (BLEO_HOME/relays.json; a missing file means no
+    relays), False sends every request directly, and a RelayRouter is used as given, so
+    several clients can share one. With an empty pool or mode "off" the request is sent
+    directly. last_route records what served the latest request.
     """
 
     def __init__(self, model=_DEFAULT_MODEL, *, x_brave_key=None, pre_shared_key=None,
                  signing_key_id=None, premium_credential=None, timeout=60.0,
-                 max_retries=3, max_retry_delay=60.0, history=False, proxy=None):
+                 max_retries=3, max_retry_delay=60.0, history=False, proxy=None, relays=None):
         if timeout <= 0 or max_retry_delay < 0:
             raise ValueError('timeout must be positive and max_retry_delay nonnegative')
         self.model = resolve_model(model)
@@ -133,7 +141,28 @@ class Bleo:
         self.history_enabled = bool(history)
         self.history = History(model=self.model)
         self.last_model = None
+        self.last_route = None
+        self._router = self._resolve_router(relays, proxy, timeout)
         self._client = Session(timeout=timeout, proxy=proxy)
+
+    @staticmethod
+    def _resolve_router(relays, proxy, timeout=None):
+        if relays is False:
+            return None
+        if relays is None:
+            # Same meaning as Session(timeout=...): a socket timeout per wait, so it bounds
+            # the wait for headers and each stall in the body, relayed or direct.
+            return RelayRouter(RelayPool.load(), proxy=proxy, header_timeout=timeout,
+                               stall_timeout=timeout)
+        if not isinstance(relays, RelayRouter):
+            raise ValueError('relays must be None, False or a RelayRouter')
+        return relays
+
+    def _active_router(self):
+        router = self._router
+        if router is None or router.pool.mode == 'off' or not router.pool.entries:
+            return None
+        return router
 
     def __enter__(self):
         return self
@@ -182,14 +211,47 @@ class Bleo:
     def _chat_stream(self, payload):
         body = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
         base = _PREMIUM_BASE if self.premium_credential else _BASE
+        router = self._active_router()
+        if router is not None:
+            return self._relay_stream(router, base, body)
+        self.last_route = Route('direct', base, None)
         return self._client.stream('POST', base + _CONVERSATION, content=body, headers=self._headers(body))
+
+    @contextmanager
+    def _relay_stream(self, router, base, body):
+        self.last_route = None
+        attempt, route = router.open(base + _CONVERSATION, headers=self._headers(body), body=body)
+        self.last_route = route
+        try:
+            yield attempt
+        finally:
+            attempt.close()
+
+    def _blame_relay(self, error):
+        """A relayed reply that failed before any text is the relay's failure, not Brave's."""
+        route, router = self.last_route, self._router
+        if router is None or route is None or route.kind != 'relay':
+            return
+        stream_broke = isinstance(error, APIError) and error.status_code is None and error.body is None
+        if stream_broke or isinstance(error, (OSError, HTTPException)):
+            router.report_failure(route)
+
+    @staticmethod
+    def _status(resp):
+        # Response (direct) has status_code; an Attempt (relay router) has status.
+        return resp.status_code if hasattr(resp, 'status_code') else resp.status
+
+    @staticmethod
+    def _text(resp):
+        return resp.text if hasattr(resp, 'text') else resp.read_all().decode('utf-8', 'replace')
 
     @staticmethod
     def _raise_for_status(resp):
-        body = resp.text
-        if resp.status_code in (401, 403):
-            raise AuthError(f'Brave authentication failed (HTTP {resp.status_code}); check service keys and signing_key_id')
-        if resp.status_code == 429:
+        body = Bleo._text(resp)
+        status = Bleo._status(resp)
+        if status in (401, 403):
+            raise AuthError(f'Brave authentication failed (HTTP {status}); check service keys and signing_key_id')
+        if status == 429:
             delay = resp.headers.get('Retry-After')
             if delay is None:
                 try:
@@ -197,7 +259,7 @@ class Bleo:
                 except (ValueError, AttributeError):
                     pass
             raise RatelimitError('Brave rate limit reached', retry_after=delay)
-        raise APIError(f'Brave HTTP {resp.status_code}', resp.status_code, body)
+        raise APIError(f'Brave HTTP {status}', status, body)
 
     @staticmethod
     def _iter_sse(resp):
@@ -240,11 +302,11 @@ class Bleo:
 
     def _attempt_stream(self, payload):
         with self._chat_stream(payload) as resp:
-            if resp.status_code != 200:
+            if self._status(resp) != 200:
                 self._raise_for_status(resp)
             saw_text = False
             is_json = resp.headers.get('Content-Type', '').split(';')[0] == 'application/json'
-            events = [resp.text] if is_json else self._iter_sse(resp)
+            events = [self._text(resp)] if is_json else self._iter_sse(resp)
             for data in events:
                 if data == '[DONE]':
                     if not saw_text:
@@ -286,7 +348,9 @@ class Bleo:
                     yielded = True
                     yield chunk
                 return
-            except (APIError, RatelimitError, OSError, HTTPException) as error:
+            except (APIError, RatelimitError, RelayExhaustedError, OSError, HTTPException) as error:
+                if not yielded:
+                    self._blame_relay(error)
                 retryable = not isinstance(error, APIError) or error.status_code is None or error.status_code >= 500
                 if yielded or not retryable or attempt + 1 == self.max_retries:
                     raise
@@ -314,6 +378,15 @@ class Bleo:
         if remember:
             self.history.add_user(prompt)
             self.history.add_assistant(''.join(collected))
+
+    def complete(self, messages, *, model=None, stream=True):
+        """Stream text chunks for OpenAI-style ``messages`` without touching ``history``.
+
+        The caller owns the whole conversation; only ``last_model`` is set, as in ``stream``.
+        """
+        payload = self._build_payload(messages, model=model, stream=stream)
+        self.last_model = None
+        yield from self._stream_with_retry(payload)
 
     def ask(self, prompt, *, remember=None, model=None):
         return ''.join(self.stream(prompt, remember=remember, model=model))
