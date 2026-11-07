@@ -728,5 +728,61 @@ class ReportTests(RouterCase):
         self.assertTrue(all(label in ('r0', 'r1') for label, _ in results))
 
 
+class CooldownSkipTests(RouterCase):
+    def cool(self, index, status=402):
+        self.health.mark_failure(self.relays[index].url, status)
+
+    def test_a_relay_in_cooldown_is_never_contacted_and_the_request_goes_direct(self):
+        self.build(reply(body=b'relay'))
+        self.cool(0)  # 402: six hours
+        attempt, route, body = self.go()
+        self.assertEqual((route.kind, body), ('direct', b'direct'))
+        self.assertEqual(self.hits(0), 0)
+
+    def test_all_relays_cooling_with_direct_off_raises_without_a_request(self):
+        self.build(reply(), reply(), direct=False)
+        self.cool(0)
+        self.cool(1)
+        with self.assertRaises(RelayExhaustedError):
+            self.go()
+        self.assertEqual((self.hits(0), self.hits(1)), (0, 0))
+        self.assertEqual(self.upstream.hits, [])
+
+    def test_a_cooling_relay_behind_a_failing_one_is_not_tried_after_it(self):
+        self.build(reply(503), reply(body=b'relay'))
+        self.cool(1)
+        _, route, body = self.go()
+        self.assertEqual((route.kind, body), ('direct', b'direct'))
+        self.assertEqual((self.hits(0), self.hits(1)), (1, 0))
+
+    def test_hedge_never_starts_a_cooling_partner(self):
+        self.build(reply(delay=0.6, body=b'slow'), reply(body=b'fast'))
+        self.cool(1)
+        _, route, body = self.go()
+        self.assertEqual((route.label, body), ('r0', b'slow'))
+        self.assertEqual(self.hits(1), 0)
+
+    def test_candidate_that_cooled_after_ordering_is_skipped(self):
+        self.build(reply(503), reply(body=b'second'), reply(body=b'third'))
+        real = self.health.mark_failure
+
+        def mark(url, status=None, error=None):
+            real(url, status, error)
+            if url == self.relays[0].url:
+                real(self.relays[1].url, 402)  # another request cools r1 while this one runs
+
+        self.health.mark_failure = mark
+        _, route, body = self.go()
+        self.assertEqual((route.label, body), ('r2', b'third'))
+        self.assertEqual(self.hits(1), 0)
+
+    def test_cooldown_that_has_expired_is_tried_again(self):
+        self.build(reply(body=b'relay'))
+        self.cool(0)
+        self.health.clock = lambda: time.monotonic() + 7 * 3600
+        _, route, body = self.go()
+        self.assertEqual((route.kind, body), ('relay', b'relay'))
+
+
 if __name__ == '__main__':
     unittest.main()

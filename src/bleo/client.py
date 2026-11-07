@@ -142,15 +142,18 @@ class Bleo:
         self.history = History(model=self.model)
         self.last_model = None
         self.last_route = None
-        self._router = self._resolve_router(relays, proxy)
+        self._router = self._resolve_router(relays, proxy, timeout)
         self._client = Session(timeout=timeout, proxy=proxy)
 
     @staticmethod
-    def _resolve_router(relays, proxy):
+    def _resolve_router(relays, proxy, timeout=None):
         if relays is False:
             return None
         if relays is None:
-            return RelayRouter(RelayPool.load(), proxy=proxy)
+            # Same meaning as Session(timeout=...): a socket timeout per wait, so it bounds
+            # the wait for headers and each stall in the body, relayed or direct.
+            return RelayRouter(RelayPool.load(), proxy=proxy, header_timeout=timeout,
+                               stall_timeout=timeout)
         if not isinstance(relays, RelayRouter):
             raise ValueError('relays must be None, False or a RelayRouter')
         return relays

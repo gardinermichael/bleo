@@ -2,6 +2,8 @@ import json
 import os
 import stat
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -309,11 +311,73 @@ class PersistenceTests(PoolCase):
         RelayPool(self.path).add('https://a.example.com', auth='s')
         self.assertFalse(os.path.exists(self.path + '.lock'))
 
-    def test_fresh_lock_is_not_broken_and_save_still_happens(self):
-        open(self.path + '.lock', 'w').close()
-        RelayPool(self.path).add('https://a.example.com', auth='s')
-        self.assertTrue(os.path.exists(self.path + '.lock'))
+    def test_held_lock_gives_a_bounded_wait_then_an_error_and_writes_nothing(self):
+        pool = RelayPool(self.path)
+        pool.add('https://a.example.com', auth='s')
+        before = self.read()
+        lock = self.path + '.lock'
+        open(lock, 'w').close()
+        started = time.monotonic()
+        with patch('bleo.relay_state.LOCK_WAIT_SECONDS', 0.3):
+            for write in (lambda: pool.add('https://b.example.com', auth='s'),
+                          lambda: pool.remove('a'),
+                          lambda: pool.set_mode('spread'),
+                          lambda: pool.set_sticky('https://a.example.com'),
+                          pool.save):
+                with self.assertRaises(OSError) as caught:
+                    write()
+                self.assertIn('locked', str(caught.exception))
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 5 * 0.3 - 0.05)
+        self.assertLess(elapsed, 5.0)
+        self.assertEqual(self.read(), before)
+        self.assertTrue(os.path.exists(lock))
+        self.assertEqual(sorted(os.listdir(self.dir)), ['relays.json', 'relays.json.lock'])
+
+    def test_a_lock_released_during_the_wait_lets_the_write_through(self):
+        pool = RelayPool(self.path)
+        lock = self.path + '.lock'
+        open(lock, 'w').close()
+        timer = threading.Timer(0.2, os.unlink, args=(lock,))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        pool.add('https://a.example.com', auth='s')
         self.assertEqual(len(RelayPool.load(self.path).entries), 1)
+        self.assertFalse(os.path.exists(lock))
+
+    def test_two_pools_interleaving_a_transaction_both_changes_survive(self):
+        RelayPool(self.path, entries=[entry('a'), entry('b')]).save()
+        first, second = RelayPool.load(self.path), RelayPool.load(self.path)
+        inside, proceed = threading.Event(), threading.Event()
+        real_write = first._write
+
+        def slow_write():
+            inside.set()
+            proceed.wait(5)
+            real_write()
+
+        first._write = slow_write
+        errors = []
+
+        def run(call):
+            try:
+                call()
+            except BaseException as error:  # reported through the assertion below
+                errors.append(error)
+
+        adder = threading.Thread(target=run, args=(lambda: first.add('https://c.example.com', auth='s'),))
+        adder.start()
+        self.assertTrue(inside.wait(5))
+        setter = threading.Thread(target=run, args=(lambda: second.set_sticky('https://b.example.com'),))
+        setter.start()
+        time.sleep(0.2)  # the second writer is now waiting on the lock, holding stale state
+        proceed.set()
+        adder.join(10)
+        setter.join(10)
+        self.assertEqual(errors, [])
+        saved = RelayPool.load(self.path)
+        self.assertEqual([e.label for e in saved.entries], ['a', 'b', 'c'])
+        self.assertEqual(saved.sticky_url, 'https://b.example.com')
 
     def test_stale_lock_is_taken_over_and_removed(self):
         lock = self.path + '.lock'

@@ -18,6 +18,8 @@ from urllib.parse import urlsplit
 
 MODES = ('auto', 'spread', 'off')
 LOCK_STALE_SECONDS = 30.0
+LOCK_WAIT_SECONDS = 5.0
+LOCK_POLL_SECONDS = 0.05
 
 COOLDOWN_DEFAULT = 30.0
 COOLDOWN_429 = 90.0
@@ -185,33 +187,34 @@ class RelayPool:
 
     @contextmanager
     def _file_lock(self):
+        """Hold the exclusive lock file, waiting up to LOCK_WAIT_SECONDS for another holder.
+
+        Raises TimeoutError (an OSError) when it cannot be taken; callers write nothing then.
+        """
         lock = self.path + '.lock'
-        held = False
         os.makedirs(os.path.dirname(self.path) or '.', mode=0o700, exist_ok=True)
-        for _ in range(2):
+        deadline = time.monotonic() + LOCK_WAIT_SECONDS
+        while True:
             try:
                 os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
-                held = True
                 break
             except FileExistsError:
                 try:
-                    stale = time.time() - os.stat(lock).st_mtime > LOCK_STALE_SECONDS
-                    if stale:
+                    if time.time() - os.stat(lock).st_mtime > LOCK_STALE_SECONDS:
                         os.unlink(lock)
                         continue
                 except OSError:
-                    continue
-                break  # a live writer holds it: proceed unlocked, the replace is atomic
-            except OSError:
-                break
+                    continue  # it vanished or was taken over meanwhile: try again
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f'Relay pool is locked by another process ({lock}); nothing was written')
+                time.sleep(LOCK_POLL_SECONDS)
         try:
             yield
         finally:
-            if held:
-                try:
-                    os.unlink(lock)
-                except OSError:
-                    pass
+            try:
+                os.unlink(lock)
+            except OSError:
+                pass
 
     def _write(self):
         directory = os.path.dirname(self.path) or '.'
@@ -239,6 +242,7 @@ class RelayPool:
         self._mtime = self._disk_mtime()
 
     def save(self):
+        """Write the pool as held (a deliberate overwrite), under the exclusive lock."""
         with self._lock, self._file_lock():
             self._write()
 
