@@ -14,11 +14,6 @@ for _alias, _model in MODEL_ALIASES.items():
     ALIASES.setdefault(_model, _alias)
 
 
-def _parse_gateways(raw: str) -> list[str]:
-    """Parse a comma-separated list of gateway URLs, stripping blanks."""
-    return [g.strip() for g in raw.split(",") if g.strip()]
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(prog="bleo", description="Brave Leo AI Chat")
     parser.add_argument("prompt_text", nargs="?", help="Prompt; omit for interactive chat")
@@ -41,31 +36,7 @@ def main() -> None:
     parser.add_argument("--image", help="Attach a local image to a one-shot prompt")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colour")
     parser.add_argument("--version", action="version", version=f"bleo {__version__}")
-    parser.add_argument("--gateways", help="Comma-separated gateway URLs for rotation/failover")
-    parser.add_argument("--gateway-cooldown", type=float, default=5.0,
-                        help="Base cooldown seconds after a gateway failure (default: 5)")
-    parser.add_argument("--gateway-max-cooldown", type=float, default=120.0,
-                        help="Maximum cooldown seconds (default: 120)")
-    parser.add_argument("--gateway-max-failures", type=int, default=5,
-                        help="Max consecutive failures before a gateway is skipped (default: 5)")
-    parser.add_argument("--api", action="store_true", help="Run OpenAI-compatible API server instead of CLI")
-    parser.add_argument("--api-host", default="127.0.0.1", help="API bind host (default: 127.0.0.1)")
-    parser.add_argument("--api-port", type=int, default=8317, help="API bind port (default: 8317)")
     args = parser.parse_args()
-
-    if args.api:
-        from .api import run as _run_api
-
-        gw = _parse_gateways(args.gateways) if args.gateways else None
-        _run_api(
-            host=args.api_host,
-            port=args.api_port,
-            gateways=gw,
-            gateway_cooldown=args.gateway_cooldown,
-            gateway_max_cooldown=args.gateway_max_cooldown,
-            gateway_max_failures=args.gateway_max_failures,
-        )
-        return
 
     ui = UI(THEME, enabled=False if args.no_color else None)
     prompt = args.prompt if args.prompt is not None else args.prompt_text
@@ -80,11 +51,7 @@ def main() -> None:
             return
         with Bleo(model=args.model, x_brave_key=args.x_brave_key,
                   pre_shared_key=args.pre_shared_key, signing_key_id=args.signing_key_id,
-                  proxy=args.proxy, history=args.history or prompt is None,
-                  gateways=(_parse_gateways(args.gateways) if args.gateways else None),
-                  gateway_cooldown=args.gateway_cooldown,
-                  gateway_max_cooldown=args.gateway_max_cooldown,
-                  gateway_max_failures=args.gateway_max_failures) as client:
+                  proxy=args.proxy, history=args.history or prompt is None) as client:
             if prompt is not None or args.image:
                 _print_reply(client, prompt or "Describe this image.", args.no_stream, ui,
                              image=args.image)
