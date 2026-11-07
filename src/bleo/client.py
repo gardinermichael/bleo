@@ -14,7 +14,8 @@ from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from ._http import Session
-from .exceptions import APIError, AuthError, BleoError, RatelimitError
+from .exceptions import APIError, AuthError, BleoError, GatewayExhaustedError, RatelimitError
+from .gateway import GatewayPool
 from .models import DefaultModel, History, Message, Qwen38, Role, list_models, model_info, resolve_model
 
 _BASE = 'https://ai-chat.bsg.brave.com'
@@ -118,7 +119,9 @@ class Bleo:
 
     def __init__(self, model=_DEFAULT_MODEL, *, x_brave_key=None, pre_shared_key=None,
                  signing_key_id=None, premium_credential=None, timeout=60.0,
-                 max_retries=3, max_retry_delay=60.0, history=False, proxy=None):
+                 max_retries=3, max_retry_delay=60.0, history=False, proxy=None,
+                 gateways=None, gateway_cooldown=5.0, gateway_max_cooldown=120.0,
+                 gateway_max_failures=5):
         if timeout <= 0 or max_retry_delay < 0:
             raise ValueError('timeout must be positive and max_retry_delay nonnegative')
         self.model = resolve_model(model)
@@ -134,6 +137,14 @@ class Bleo:
         self.history = History(model=self.model)
         self.last_model = None
         self._client = Session(timeout=timeout, proxy=proxy)
+        self._gateway_pool = None
+        if gateways:
+            self._gateway_pool = GatewayPool(
+                gateways,
+                base_cooldown=gateway_cooldown,
+                max_cooldown=gateway_max_cooldown,
+                max_failures=gateway_max_failures,
+            )
 
     def __enter__(self):
         return self
@@ -179,9 +190,12 @@ class Bleo:
                 'brave_capability': ['chat'], 'model': selected,
                 'stream': stream, 'system_language': 'en_US'}
 
-    def _chat_stream(self, payload):
+    def _chat_stream(self, payload, gateway=None):
         body = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
-        base = _PREMIUM_BASE if self.premium_credential else _BASE
+        if gateway is not None:
+            base = gateway.url
+        else:
+            base = _PREMIUM_BASE if self.premium_credential else _BASE
         return self._client.stream('POST', base + _CONVERSATION, content=body, headers=self._headers(body))
 
     @staticmethod
@@ -238,8 +252,8 @@ class Bleo:
             return ''.join(part.get('text', '') for part in content if isinstance(part, dict) and isinstance(part.get('text', ''), str))
         raise APIError('Invalid completion content', 200)
 
-    def _attempt_stream(self, payload):
-        with self._chat_stream(payload) as resp:
+    def _attempt_stream(self, payload, gateway=None):
+        with self._chat_stream(payload, gateway=gateway) as resp:
             if resp.status_code != 200:
                 self._raise_for_status(resp)
             saw_text = False
@@ -280,23 +294,22 @@ class Bleo:
 
     def _stream_with_retry(self, payload):
         for attempt in range(self.max_retries):
+            gateway = None
+            hedge_gateway = None
+            if self._gateway_pool is not None:
+                gateway = self._gateway_pool.select()
+                if gateway is None:
+                    raise GatewayExhaustedError(
+                        'All gateways are unavailable or in cooldown'
+                    )
+                ordered = self._gateway_pool._ordered(_now())
+                remaining = [g for g in ordered if g is not gateway
+                             and self._gateway_pool._is_healthy(g, _now())]
+                if remaining:
+                    hedge_gateway = remaining[0]
+
             yielded = False
-            try:
-                for chunk in self._attempt_stream(payload):
-                    yielded = True
-                    yield chunk
-                return
-            except (APIError, RatelimitError, OSError, HTTPException) as error:
-                retryable = not isinstance(error, APIError) or error.status_code is None or error.status_code >= 500
-                if yielded or not retryable or attempt + 1 == self.max_retries:
-                    raise
-                delay = 1.5 * 2 ** attempt
-                if isinstance(error, RatelimitError):
-                    delay = max(delay, 60.0 if error.retry_after is None else error.retry_after)
-                    if delay > self.max_retry_delay:
-                        raise
-                time.sleep(delay)
-        raise BleoError('No completion attempts were made')
+            start = _now()
 
     def stream(self, prompt, *, remember=None, model=None):
         if isinstance(prompt, str) and not prompt.strip():

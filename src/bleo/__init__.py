@@ -3,7 +3,8 @@ bleo — Unofficial Python client for Brave Leo AI Chat (brave://leo-ai).
 """
 
 from .client import Bleo
-from .exceptions import APIError, AuthError, BleoError, RatelimitError
+from .exceptions import APIError, AuthError, BleoError, GatewayExhaustedError, RatelimitError
+from .gateway import GatewayHealth, GatewayPool
 from .models import (
     Automatic,
     ClaudeHaiku,
@@ -51,6 +52,9 @@ __all__ = [
     "AuthError",
     "RatelimitError",
     "APIError",
+    "GatewayExhaustedError",
+    "GatewayHealth",
+    "GatewayPool",
     "Automatic",
     "ClaudeHaiku",
     "ClaudeSonnet",

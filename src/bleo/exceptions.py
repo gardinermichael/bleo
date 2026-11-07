@@ -39,3 +39,7 @@ class APIError(BleoError):
         super().__init__(message)
         self.status_code = status_code
         self.body = body
+
+
+class GatewayExhaustedError(BleoError):
+    """All gateways are unavailable (cooled-down or over the failure cap)."""
