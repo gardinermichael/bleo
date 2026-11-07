@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stdout
 from http.client import HTTPException
+import io
 import json
 import os
 import pathlib
@@ -9,7 +11,7 @@ import sys
 import tempfile
 import time
 
-from . import Bleo, BleoError, __version__, client as _client
+from . import Bleo, BleoError, __version__, client as _client, relay_deploy
 from .relay import RelayRouter
 from .relay_state import RelayPool
 from .relay_templates import PLATFORMS, new_secret, write_template
@@ -353,6 +355,13 @@ def _relay_parser():
     template = commands.add_parser("template", help="Write a deployable relay and a fresh secret")
     template.add_argument("platform", choices=PLATFORMS)
     template.add_argument("--out", help="Output folder (default ./bleo-relay-<platform>)")
+    deploy = commands.add_parser("deploy", help="Deploy a relay to your own platform account and save it")
+    deploy.add_argument("platform", choices=PLATFORMS)
+    deploy.add_argument("--name", help="Name on the platform (default bleo-relay-<random>)")
+    deploy.add_argument("--label", help="Name in the pool (default: the platform name)")
+    deploy.add_argument("--replace", action="store_true",
+                        help="Replace an existing relay with this label once the new one is deployed")
+    deploy.add_argument("--no-probe", action="store_true", help="Do not probe the new relay")
     add = commands.add_parser("add", help="Save a relay")
     add.add_argument("url")
     add.add_argument("--auth", required=True, help="The relay's BLEO_RELAY_SECRET")
@@ -392,6 +401,58 @@ def _relay_template(args, ui) -> int:
     print("Set it as BLEO_RELAY_SECRET on the platform, deploy, then run:")
     print("  bleo relay add <deployed-url> --auth <that secret>")
     return 0
+
+
+DEPLOY_PROBE_WINDOW = 30.0
+DEPLOY_PROBE_INTERVAL = 2.0
+
+
+def _relay_deploy(args, ui) -> int:
+    label = (args.label or args.platform).strip()
+    old = next((e for e in RelayPool.load().entries if e.label.lower() == label.lower()), None)
+    if old and not args.replace:
+        raise ValueError(f"a relay labelled {label!r} already exists; use --replace or pick another --label")
+    name = relay_deploy.platform_name(args.platform, args.name or relay_deploy.default_name())
+    token = relay_deploy.read_token(args.platform)
+    secret = new_secret()
+    url = relay_deploy.deploy(args.platform, token, name, secret,
+                              progress=lambda message: print(message, file=sys.stderr))
+    del token  # the token is only ever held in this call
+    pool = RelayPool.load()
+    if old:
+        pool.remove(old.label)
+    try:
+        entry = pool.add(url, auth=secret, label=label)
+    except ValueError:
+        if old:
+            pool.add(old.url, auth=old.auth, label=old.label)
+        raise
+    print(f"platform: {args.platform}")
+    print(f"name: {name}")
+    print(f"url: {entry.url}")
+    print(f"label: {entry.label}")
+    print("secret: set on platform")
+    if args.no_probe:
+        print(f"probe: skipped; run: bleo relay probe {entry.label}")
+        return 0
+    return _probe_until_ready(entry.label)
+
+
+def _probe_until_ready(label) -> int:
+    """Probe like `bleo relay probe`, retrying while the new deployment comes up."""
+    deadline = time.monotonic() + DEPLOY_PROBE_WINDOW
+    while True:
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = _relay_probe(argparse.Namespace(label=label), None)
+        if code == 0 or time.monotonic() >= deadline:
+            break
+        time.sleep(DEPLOY_PROBE_INTERVAL)
+    print(buffer.getvalue(), end="")
+    print(f"probe result: {'PASS' if code == 0 else 'FAIL'}")
+    if code:
+        print(f"The relay stays in the pool. To remove it: bleo relay remove {label}")
+    return code
 
 
 def _relay_add(args, ui) -> int:
@@ -525,7 +586,7 @@ def _read_probe_stream(attempt):
     return stream
 
 
-_RELAY_COMMANDS = {"template": _relay_template, "add": _relay_add, "remove": _relay_remove,
+_RELAY_COMMANDS = {"template": _relay_template, "deploy": _relay_deploy, "add": _relay_add, "remove": _relay_remove,
                    "list": _relay_list, "mode": _relay_mode, "probe": _relay_probe}
 
 

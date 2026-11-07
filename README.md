@@ -105,7 +105,23 @@ The signing key ID must match the pre-shared key. Changing it to match an instal
 
 A relay is a small forwarder you deploy yourself, on Cloudflare Workers, Deno Deploy or Vercel Edge. It forwards only to Brave Leo's two hosts (`ai-chat.bsg.brave.com` and `ai-chat-premium.bsg.brave.com`), and only for requests that carry your shared secret. bleo can spread its requests over several relays.
 
-Create the deployable files for one platform. The command prints a new 64-character secret once; copy it.
+Deploy one in a single step:
+
+```sh
+bleo relay deploy cloudflare        # or: deno, vercel
+```
+
+It asks for your platform API token (typed hidden, or read from `CLOUDFLARE_API_TOKEN`, `DENO_DEPLOY_TOKEN` or `VERCEL_TOKEN`), makes a fresh secret, uploads the relay to your account through the platform's API, stores the secret there as `BLEO_RELAY_SECRET`, saves the relay in your pool and probes it with no direct fallback. The token is used in memory only: it is never saved, logged or printed. The secret is never part of the uploaded code; bleo keeps it in the pool file for you. If the probe fails, the relay stays in the pool and the command says how to remove it.
+
+Options: `--name NAME` (the name on the platform; default `bleo-relay-` plus six random characters), `--label LABEL` (the pool label; default the platform name), `--replace` (replace an existing relay with that label once the new one is deployed), `--no-probe`. The probe is retried for up to 30 seconds while the new deployment comes up.
+
+- Cloudflare: if your token sees more than one account, set `CLOUDFLARE_ACCOUNT_ID` to choose one. The relay is served from your `workers.dev` subdomain.
+- Vercel: creates a project named after `--name`. The Hobby plan caps origin transfer, and a streaming relay uses a lot of it, so use a paid plan or a project you can afford to lose.
+- Deno Deploy: Deno may rewrite the `User-Agent` header, so check the probe result before you rely on it.
+
+### Manual deploy
+
+If you would rather deploy by hand, create the deployable files for one platform. The command prints a new 64-character secret once; copy it.
 
 ```sh
 bleo relay template cloudflare      # or: deno, vercel (writes ./bleo-relay-<platform>)
@@ -115,7 +131,7 @@ Then follow that platform's README: [Cloudflare](src/bleo/relay_templates/cloudf
 
 - Cloudflare: `npx wrangler deploy`, then `npx wrangler secret put BLEO_RELAY_SECRET`.
 - Vercel: `vercel deploy --prod`, then `vercel env add BLEO_RELAY_SECRET` and redeploy.
-- Deno Deploy: add `BLEO_RELAY_SECRET` in the app's settings and redeploy if asked. The Deno README warns that Deno may rewrite the `User-Agent` header, so check the relay with a probe before you rely on it.
+- Deno Deploy: add `BLEO_RELAY_SECRET` in the app's settings and redeploy if asked.
 
 Add the relay to bleo with the deployed URL and the same secret, then probe it:
 
