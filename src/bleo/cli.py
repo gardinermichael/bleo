@@ -194,6 +194,7 @@ def _print_reply(client, prompt, no_stream=False, ui=None, image=None, verbose=F
         print()
     if verbose:
         route = getattr(client, "last_route", None)
+        sys.stdout.flush()
         print(f"route: {route.label if route and route.kind == 'relay' else 'direct'}", file=sys.stderr)
 
 
