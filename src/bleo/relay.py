@@ -168,8 +168,9 @@ class _Turn:
 
 class RelayRouter:
     def __init__(self, pool, *, health=None, proxy=None, hedge_grace=8.0, header_timeout=None,
-                 stall_timeout=None, allow_insecure_for_tests=False):
+                 stall_timeout=None, allow_insecure_for_tests=False, direct=True):
         self.pool = pool
+        self.direct = direct
         self.health = health or HealthBook()
         self.proxy = proxy
         self.hedge_grace = hedge_grace
@@ -196,6 +197,8 @@ class RelayRouter:
             index += used
             if winner is not None:
                 return self._won(winner)
+        if not self.direct:
+            raise RelayExhaustedError('Relays exhausted and direct fallback is off', last_status=turn.last_status)
         return self._direct(call, turn)
 
     def report_failure(self, route, status=None):
