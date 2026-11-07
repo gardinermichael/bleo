@@ -190,7 +190,7 @@ class RelayRouter:
         turn = _Turn()
         index = 0
         while index < len(candidates):
-            if not self._valid(candidates[index]):
+            if not self._startable(candidates[index]):
                 index += 1
                 continue
             winner, used = self._race(candidates, index, call, turn)
@@ -218,6 +218,10 @@ class RelayRouter:
         except ValueError as error:
             log.warning('relay %s skipped: %s', entry.label, error)
             return False
+
+    def _startable(self, entry):
+        """Valid and out of cooldown, checked now: ordering may have been computed earlier."""
+        return self.health.is_healthy(entry.url) and self._valid(entry)
 
     def _make_attempt(self, url, method, headers, body):
         extra = {}

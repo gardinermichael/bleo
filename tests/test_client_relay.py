@@ -4,6 +4,7 @@ from http.client import HTTPConnection
 import json
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -165,6 +166,51 @@ class ClientRelayTests(RelayFixture, unittest.TestCase):
                 self.assertEqual(client.ask('hello'), 'saved relay')
                 self.assertEqual(client.last_route.label, 'saved')
 
+    def saved_pool_client(self, behavior, timeout):
+        relay = self.serve(behavior)
+        with patch.dict(os.environ, {'BLEO_HOME': self.home}):
+            RelayPool(entries=[RelayEntry(relay.url, 'saved', 's', '')]).save()
+        insecure = patch('bleo.relay.validate_relay_url', lambda url, allow_insecure=False: url)
+        insecure.start()
+        self.addCleanup(insecure.stop)
+        environ = patch.dict(os.environ, {'BLEO_HOME': self.home})
+        environ.start()
+        self.addCleanup(environ.stop)
+        return relay, Bleo(timeout=timeout)
+
+    def assertTimesOutQuickly(self, behavior):
+        relay, client = self.saved_pool_client(behavior, 0.25)
+        started = time.monotonic()
+        with client:
+            text = client.ask('hello')
+        elapsed = time.monotonic() - started
+        self.assertEqual(len(relay.hits), 1)
+        self.assertEqual(text, 'direct text')  # the stuck relay was abandoned for the direct path
+        self.assertLess(elapsed, 3.0)
+
+    def test_client_timeout_bounds_a_relay_that_delays_headers(self):
+        self.assertTimesOutQuickly(reply(delay=10))
+
+    def test_client_timeout_bounds_a_relay_that_stalls_mid_body(self):
+        def stall(handler, server):
+            handler.close_connection = True
+            handler.send_response(200)
+            handler.send_header('Content-Type', 'text/event-stream')
+            handler.send_header('Connection', 'close')
+            handler.end_headers()
+            handler.wfile.write(b': keepalive\n\n')
+            handler.wfile.flush()
+            server.release.wait(10)
+        self.assertTimesOutQuickly(stall)
+
+    def test_client_timeout_reaches_a_router_it_builds_but_not_one_it_is_given(self):
+        _, client = self.saved_pool_client(stream_reply(), 7.5)
+        with client:
+            self.assertEqual((client._router.header_timeout, client._router.stall_timeout), (7.5, 7.5))
+        router = self.router_over(stream_reply())
+        with Bleo(relays=router, timeout=7.5) as client:
+            self.assertIsNone(client._router.header_timeout)
+
     def test_relays_argument_is_validated(self):
         with self.assertRaises(ValueError):
             Bleo(relays='yes')
@@ -250,7 +296,9 @@ class ApiSharedRouterTests(RelayFixture, unittest.TestCase):
         self.assertIs(server.router, router)
         self.assertEqual([client._router for client in seen], [router, router])
         self.assertEqual(len({id(client) for client in seen}), 2)
-        self.assertEqual(self.failures(0), 2)  # the second request saw and extended the same HealthBook
+        # The second request saw the same HealthBook: r0 was cooling, so it was never started.
+        self.assertEqual(self.failures(0), 1)
+        self.assertEqual(len(self.relays[0].hits), 1)
         self.assertEqual(len(self.brave.hits), 2)
 
     def test_requests_go_through_the_shared_relay(self):
