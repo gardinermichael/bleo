@@ -170,6 +170,14 @@ class _Upstream(BaseHTTPRequestHandler):
             'headers': [(name.lower(), value) for name, value in self.headers.items()],
             'body': body,
         })
+        if self.path.startswith('/redirect/'):
+            # /redirect/<code> answers with a redirect to the second server (another origin).
+            code = int(self.path.split('?')[0].rsplit('/', 1)[1])
+            self.send_response(code)
+            self.send_header('location', self.server.redirect_to)
+            self.send_header('content-length', '0')
+            self.end_headers()
+            return
         reply = 'ok: héllo ✓'.encode('utf-8')
         self.send_response(200)
         self.send_header('content-type', 'text/plain; charset=utf-8')
@@ -193,16 +201,25 @@ class RelayBehaviourTests(unittest.TestCase):
         cls.server = ThreadingHTTPServer(('127.0.0.1', 0), _Upstream)
         cls.server.received = []
         cls.upstream = f'http://127.0.0.1:{cls.server.server_address[1]}'
+        # A second origin that is not on the allowlist: a redirect from the upstream lands here.
+        cls.elsewhere = ThreadingHTTPServer(('127.0.0.1', 0), _Upstream)
+        cls.elsewhere.received = []
+        cls.elsewhere_url = f'http://127.0.0.1:{cls.elsewhere.server_address[1]}'
+        cls.server.redirect_to = cls.elsewhere_url + '/landed'
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        threading.Thread(target=cls.elsewhere.serve_forever, daemon=True).start()
 
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
         cls.server.server_close()
+        cls.elsewhere.shutdown()
+        cls.elsewhere.server_close()
         cls.tmp.cleanup()
 
     def setUp(self):
         self.server.received.clear()
+        self.elsewhere.received.clear()
         self.allow_stand_in = {'allowlist': [self.upstream], 'allowPrivateTargets': True}
 
     def relay(self, method='POST', headers=None, body=None, secret=SECRET, options=None):
@@ -285,6 +302,26 @@ class RelayBehaviourTests(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(body, b'{"error":"forbidden x-relay-path (host mismatch)"}')
         self.assertEqual(self.server.received, [])
+
+    def test_cross_origin_redirect_is_returned_not_followed(self):
+        # Synthetic credentials: they must never reach the second origin.
+        credentials = {
+            'authorization': 'Signature keyId="k1",algorithm="hs2019",headers="digest",signature="c2ln"',
+            'digest': 'SHA-256=YWJj',
+            'cookie': '__Secure-sku#brave-leo-premium=cred-value',
+        }
+        for code in (301, 302, 307, 308):
+            with self.subTest(code=code):
+                self.server.received.clear()
+                self.elsewhere.received.clear()
+                status, headers, body = self.relay(
+                    method='POST', headers=dict(credentials, **{'x-relay-path': f'/redirect/{code}'}),
+                    body=b'{"prompt":"x"}', options=self.allow_stand_in)
+                self.assertEqual(status, code)
+                self.assertEqual(headers.get('location'), self.elsewhere_url + '/landed')
+                self.assertEqual(body, b'')
+                self.assertEqual(len(self.server.received), 1)
+                self.assertEqual(self.elsewhere.received, [])
 
     def test_method_not_allowed(self):
         status, _, body = self.relay(method='DELETE', options=self.allow_stand_in)
