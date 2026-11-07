@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import hmac
+import ipaddress
 import json
 import os
 import secrets
@@ -555,10 +556,10 @@ class _Handler(BaseHTTPRequestHandler):
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, port, token, default_model, router=None):
+    def __init__(self, port, token, default_model, router=None, host=HOST):
         if not token:
             raise ValueError('an API token is required')
-        super().__init__((HOST, port), _Handler)
+        super().__init__((host, port), _Handler)
         self.token = token
         self.default_model = default_model
         self.router = router
@@ -569,13 +570,25 @@ class _Server(ThreadingHTTPServer):
             _log_internal(error)
 
 
-def create_server(port=DEFAULT_PORT, *, token, default_model=None, relays=None):
-    """Return a server bound to 127.0.0.1:port (0 picks a free port); call serve_forever().
+def create_server(port=DEFAULT_PORT, *, token, default_model=None, relays=None, host=HOST):
+    """Return a server bound to host:port (127.0.0.1 unless told otherwise; port 0 picks a free
+    port); call serve_forever().
 
     relays: None shares one router built from the saved relay pool (none when it is empty or
     off), False uses no relays, a RelayRouter is shared as given. Fixed at server start.
     """
-    return _Server(port, token, resolve_model(default_model), shared_router(relays))
+    return _Server(port, token, resolve_model(default_model), shared_router(relays), host=_check_host(host))
+
+
+def _check_host(host):
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        raise ValueError(f'--host must be an IP address, not {host!r}') from None
+
+
+def _is_loopback(host):
+    return ipaddress.ip_address(host).is_loopback
 
 
 # ── command line ─────────────────────────────────────────────────────────
@@ -584,7 +597,10 @@ _make_stop_event = threading.Event
 
 
 def _parser():
-    parser = argparse.ArgumentParser(prog='bleo-api', description='bleo OpenAI-compatible API server (127.0.0.1 only)')
+    parser = argparse.ArgumentParser(prog='bleo-api', description='bleo OpenAI-compatible API server')
+    parser.add_argument('--host', default=os.environ.get('BLEO_API_HOST') or HOST,
+                        help=f'listen address (default {HOST}, or BLEO_API_HOST); anything else is '
+                             'reachable by other machines, e.g. 0.0.0.0 inside a container')
     parser.add_argument('--port', type=int, default=DEFAULT_PORT, help=f'listen port (default {DEFAULT_PORT})')
     parser.add_argument('--model', help='default model when a request names none')
     parser.add_argument('--tunnel', choices=('cloudflare', 'tailscale'), help='publish the API through a tunnel')
@@ -644,10 +660,13 @@ def _start_tunnel(args, port):
 
 
 def _serve(args):
-    server = create_server(args.port, token=load_token(), default_model=args.model)
-    port = server.server_address[1]
+    server = create_server(args.port, token=load_token(), default_model=args.model, host=args.host)
+    host, port = server.server_address[:2]
     threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.05}, daemon=True).start()
-    print(f'bleo-api listening on http://{HOST}:{port}', flush=True)
+    print(f'bleo-api listening on http://{host}:{port}', flush=True)
+    if not _is_loopback(host):
+        print(f'warning: listening on {host}, not loopback: other machines can reach the API '
+              '(the token is still required)', file=sys.stderr, flush=True)
     print(f'API token {_token_source()}', flush=True)
     stop = _make_stop_event()
     previous = {}

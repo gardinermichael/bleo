@@ -164,7 +164,7 @@ The pool is stored in `~/.bleo/relays.json` (or under `BLEO_HOME`) with mode 060
 
 ## OpenAI-compatible API (bleo-api)
 
-`bleo-api` serves bleo through an OpenAI-style chat-completions endpoint, so OpenAI-compatible clients can use it. It listens on `127.0.0.1` only, on port 8317 by default (`--port`).
+`bleo-api` serves bleo through an OpenAI-style chat-completions endpoint, so OpenAI-compatible clients can use it. It listens on `127.0.0.1`, port 8317, by default (`--host`, `--port`). `--host 0.0.0.0` (or `BLEO_API_HOST`) is for inside a container, where the container's own port publishing decides who can reach it; bleo warns whenever it listens beyond loopback.
 
 ```sh
 bleo-api                             # http://127.0.0.1:8317
@@ -220,7 +220,7 @@ Ignored: any other top-level field, such as `temperature`, `top_p`, `seed` or `u
 
 ## Remote access
 
-`bleo-api` always binds `127.0.0.1`. A tunnel publishes that port, and the public URL is printed when the tunnel starts. The token is still required. Copy it to a client with `bleo-api token --show`, run in a terminal, over a channel you trust.
+`bleo-api` binds `127.0.0.1` unless `--host` says otherwise. A tunnel publishes that port, and the public URL is printed when the tunnel starts. The token is still required. Copy it to a client with `bleo-api token --show`, run in a terminal, over a channel you trust.
 
 - Named Cloudflare tunnel, with streaming: `bleo-api --tunnel cloudflare --tunnel-name NAME`. The tunnel must already exist in your `cloudflared` setup, and `cloudflared` must be on `PATH`.
 - Cloudflare quick tunnel: `bleo-api --tunnel cloudflare --quick`. It prints a random `*.trycloudflare.com` URL. Quick tunnels refuse streaming with `400` and code `streaming_unsupported`, so send `"stream": false`.

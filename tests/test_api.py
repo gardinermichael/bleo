@@ -186,10 +186,9 @@ class AuthTests(ApiCase):
         with self.assertRaises(ValueError):
             api.create_server(0, token='')
 
-    def test_server_binds_loopback_and_has_no_host_option(self):
+    def test_server_binds_loopback_by_default(self):
+        # Listening beyond loopback is opt-in (--host, for containers); see HostTests.
         self.assertEqual(self.server.server_address[0], '127.0.0.1')
-        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
-            api.main(['--host', '0.0.0.0'])
 
 
 class SecurityTests(ApiCase):
@@ -890,6 +889,43 @@ class ReviewFixTests(unittest.TestCase):
         router = api.shared_router()
         self.assertEqual((router.header_timeout, router.stall_timeout),
                          (api.UPSTREAM_TIMEOUT, api.UPSTREAM_TIMEOUT))
+
+
+
+class HostTests(ApiCase):
+    def start(self, argv, env=None):
+        out, err = StringIO(), StringIO()
+        with patch.dict(os.environ, env or {}), \
+                patch('bleo.api._make_stop_event', side_effect=lambda: preset_event()), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = api.main(['--port', '0', *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_default_is_loopback_without_a_warning(self):
+        code, out, err = self.start([])
+        self.assertEqual(code, 0)
+        self.assertIn('listening on http://127.0.0.1:', out)
+        self.assertNotIn('warning', err)
+
+    def test_any_address_binds_and_warns(self):
+        code, out, err = self.start(['--host', '0.0.0.0'])
+        self.assertEqual(code, 0)
+        self.assertIn('listening on http://0.0.0.0:', out)
+        self.assertIn('other machines can reach the API', err)
+        self.assertNotIn(TOKEN, out + err)
+
+    def test_env_sets_the_default(self):
+        _, out, _ = self.start([], env={'BLEO_API_HOST': '0.0.0.0'})
+        self.assertIn('listening on http://0.0.0.0:', out)
+
+    def test_a_hostname_is_refused(self):
+        with self.assertRaisesRegex(ValueError, 'must be an IP address'):
+            api.create_server(0, token=TOKEN, host='localhost', relays=False)
+
+    def test_create_server_binds_the_given_host(self):
+        server = api.create_server(0, token=TOKEN, host='0.0.0.0', relays=False)
+        self.addCleanup(server.server_close)
+        self.assertEqual(server.server_address[0], '0.0.0.0')
 
 
 if __name__ == '__main__':
