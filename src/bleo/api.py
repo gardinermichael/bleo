@@ -274,12 +274,13 @@ class Limiter:
         self._buffer = ''
         self._emitted = 0
 
-    def _cap(self, text, reason):
+    def _cap(self, text, reason, final=False):
         if self._max_chars is not None:
             room = self._max_chars - self._emitted
             if len(text) > room:
                 text, reason = text[:room], 'length'
-            elif reason is None and len(text) == room and self._buffer:
+            elif reason is None and text and len(text) == room and (self._buffer or not final):
+                # Budget spent: finish now rather than wait on (or fail with) more upstream.
                 reason = 'length'
         self._emitted += len(text)
         return text, reason
@@ -297,7 +298,7 @@ class Limiter:
 
     def flush(self):
         text, self._buffer = self._buffer, ''
-        return self._cap(text, None)
+        return self._cap(text, None, final=True)
 
 
 def limited(chunks, limiter):
