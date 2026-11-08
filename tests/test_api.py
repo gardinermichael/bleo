@@ -535,6 +535,22 @@ class LimitTests(ApiCase):
             self.assertIsNone(reason)
         self.assertEqual(''.join(emitted) + limiter.flush()[0], 'abSTOx')
 
+    def test_exact_budget_finishes_with_length_without_reading_upstream_again(self):
+        def upstream():
+            yield 'abcd'  # max_tokens=1 is 4 characters: exactly the budget
+            raise AssertionError('upstream read again after the budget was spent')
+        self.assertEqual(list(api.limited(upstream(), api.Limiter((), 1))), [('abcd', 'length')])
+
+    def test_exact_budget_mid_stream_is_length_and_at_the_end_is_stop(self):
+        self.assertEqual(list(api.limited(iter(['ab', 'cd']), api.Limiter((), 1))),
+                         [('ab', None), ('cd', 'length')])
+        self.assertEqual(list(api.limited(iter(['abcd']), api.Limiter(('zz',), 1))),
+                         [('abc', None), ('d', 'stop')])
+
+    def test_under_budget_still_reads_on(self):
+        self.assertEqual(list(api.limited(iter(['ab', 'c']), api.Limiter((), 1))),
+                         [('ab', None), ('c', None), ('', 'stop')])
+
 
 class StreamTests(ApiCase):
     def test_sse_sequence_role_content_finish_done(self):
